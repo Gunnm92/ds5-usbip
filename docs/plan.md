@@ -370,6 +370,11 @@ resté sur la sortie par défaut (Sunshine 5.1 : canaux 3-4 sur FC/LFE,
 `pactl move-sink-input`. Gain à l'émission ×2 (`--haptics-gain-file
 /tmp/ds5-haptics-gain`, réglable à chaud).
 
+Gâchettes adaptatives : OK dans F1 25. Dans RIDE 6, le journal décodé
+montre que le jeu n'envoie qu'un « effet désactivé » (mode 0x05) : RIDE 6
+n'a pas de gâchettes adaptatives (vérifié en direct sur AIBox). Le renvoi
+des rapports de sortie passe par une file (fb94a00), sans fusion.
+
 Recette qui marche aujourd'hui (à automatiser en phases 2-3) :
 - SteamBox : serveur avec `-t <IP client>:46100 --haptics-gain-file …`,
   sortie DualSense à 100 %, manette branchée **avant** le lancement du jeu ;
