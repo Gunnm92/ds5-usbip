@@ -141,6 +141,96 @@ fois le critère atteint.
 But : prouver qu'une DualSense USB émulée en USB/IP obtient une carte son
 et un conteneur Wine.
 
+**État (22/11)** :
+
+- [x] 1-2. Serveur USB/IP C++ et profil DualSense : `src/` (descripteurs
+  extraits de vds, rapports feature 0x05/0x09/0x20 de libvirtualhid), binaire
+  statique `build/ds5-usbip-proto` (`make`). Contrôle, HID IN toutes les
+  4 ms, HID OUT, isochrone OUT et IN rythmés à 1 ms par paquet, UNLINK.
+  Validé par `tests/usbip_client_test.py` (client qui imite `vhci-hcd`,
+  28 vérifications). Le prototype affiche chaque seconde le niveau des
+  4 canaux et peut enregistrer le PCM (`--dump`).
+- [ ] 3. Attache sur l'hôte (serveur lancé dans le conteneur code-server).
+  L'outil `usbip` n'est pas dans le PATH d'Unraid malgré le plugin :
+  remplacé par `build/ds5-usbip-attach` (import USB/IP puis écriture dans
+  `/sys/devices/platform/vhci_hcd.0/attach`), base de l'attache par
+  Sunshine en phase 2.
+  Énumération validée sur l'hôte : carte `Controller` (lecture 4 canaux
+  48 kHz S16_LE FL FR RL RR, capture 2 canaux), hidraw sous le même parent
+  USB `3-1` que la carte son, `hid-playstation` lié (rapports feature lus,
+  LED reçue). Isochrone validé : `aplay -D hw:Controller -c 4 -r 48000
+  -f S16_LE -d 5 /dev/urandom` (conteneur alpine jetable avec `/dev/snd`) →
+  48 000 trames/s reçues, 5 s exactement, signal sur les 4 canaux, niveau
+  RMS conforme (-4,8 dB) : ni perte ni décalage. **Étape 3 validée.**
+- [ ] 4. SteamBox : accès à ALSA ajouté (règle cgroup `c 116:* rmw` dans
+  le modèle Unraid, `docs/deploiement-unraid.md` et le compose ; règle udev
+  `99-steambox-snd-fallback.rules` dans l'image). `/sys` étant en lecture
+  seule dans le conteneur, la manette doit être attachée après son
+  démarrage. Vérifié : `/dev/snd/*` (groupe audio), `/dev/hidraw5`
+  (groupe input), sortie PipeWire 4 canaux FL FR RL RR avec
+  `device.bus=usb`, `device.vendor.id=0x054c`, `device.product.id=0x0ce6`.
+  Points ouverts : la sortie devient celle par défaut hors session ; deux
+  DualSense pendant une session (celle de Sunshine et l'émulée). Reste :
+  RIDE 6 sous GE-Proton.
+  1er essai RIDE 6 : Wine ouvre les deux hidraw, le jeu prend la manette
+  active (Sunshine, sans carte son) et n'ouvre que ses flux 6 canaux.
+  Pour le test, option `--mirror /dev/hidrawN --hide-mirror` : le
+  prototype, lancé dans SteamBox (127.0.0.1), recopie les entrées de la
+  manette Sunshine, lui renvoie les rapports de sortie, et masque son nœud.
+  L'API Docker refuse la copie de fichiers (403) : binaire passé par le
+  partage Game (`/config/games/Batocera` dans SteamBox).
+  2e essai (RIDE 6 puis F1 25, manette émulée seule visible) : Wine crée
+  `HID\VID_054C&PID_0CE6&MI_03\…35:53:3A:D6:E7:74` avec un vrai
+  **ContainerId** `{0CE6054C-0003-0004-DDAC-18C70B000000}` (objectif Wine
+  atteint), mais les jeux ne détectent pas la manette. Piste : Steam Input
+  la déclare dans `virtualgamepadinfo.txt` (handle = MAC), Proton la cache
+  au jeu, et aucune manette virtuelle Steam n'existe. Steam Input était
+  pourtant déjà désactivé pour le jeu. En fait, Sunshine avait recréé sa
+  manette (reconnexion Moonlight, `hidraw7`) : recopie perdue, la nouvelle
+  non masquée et reprise par le jeu. D'où `--mirror auto` : trouve la
+  DualSense uhid, la suit à chaque recréation et la masque.
+  Puis plus aucune requête du jeu vers la manette (journal verbeux vide) :
+  cause = le masquage par suppression du nœud. Le lanceur wsquashfs
+  (`hidrawUsable`) exige que toute manette Sony de `/sys/class/hidraw`
+  s'ouvre dans `/dev`, sinon il laisse `DisableHidraw=1` sans
+  `PROTON_SONY_HIDRAW_XINPUT` : GE-Proton ignore alors toutes les manettes
+  Sony. Masquage refait par un leurre (nœud vers `/dev/null`, que Wine
+  écarte faute de descripteur HID).
+  **3e essai RIDE 6 : critère haptique atteint.** Le jeu lit les rapports
+  feature 0x09/0x20/0x05, écrit 0x08, envoie des rapports de sortie 0x02,
+  et ouvre un flux **4 canaux s16le** (« PipeWire ALSA [wine64-preloader] »)
+  vers la carte de la manette. En roulant : signal sur les canaux 3-4
+  seulement (pointes 500-1900, -35 à -56 dB RMS, variable), canaux 1-2
+  muets. PCM enregistré dans `/tmp/ds5-audio.raw` (SteamBox). Reste :
+  direction qui décroche par moments (recopie des entrées, à diagnostiquer).
+  Analyse de l'enregistrement (220 s de flux, 109 s avec signal) : canaux
+  1-2 toujours nuls ; canaux 3-4 indépendants (gauche seule, droite seule,
+  les deux), pics jusqu'à 1 940, plages stables ~200 RMS : profil
+  d'haptiques de conduite. **Critère de la phase 0 atteint** (ressenti à
+  confirmer en phase 1).
+  Décrochages de direction expliqués : interblocage. Le fil USB/IP écrivait
+  lui-même les rapports de sortie vers la manette Sunshine (`write` sur
+  hidraw) ; le noyau, verrou global hidraw pris pour une fermeture,
+  attendait de ce fil l'annulation d'un URB. Tout hidraw figé (jeu, lanceur,
+  PipeWire) jusqu'au détachement. Corrigé : fil d'écriture dédié, seul le
+  dernier rapport est gardé. Leçon pour la phase 2 : ne jamais bloquer le
+  fil USB/IP.
+  Revérification avec F1 25 (correctif en place) : flux 4 canaux, 169 s
+  d'haptiques sur 315 s (pic 2 097), canaux 1-2 muets ; gâchettes
+  adaptatives fonctionnelles (40 000 rapports de sortie renvoyés à
+  Sunshine) ; direction fiable, plus aucun blocage.
+- [x] **Phase 0 validée (22/11)** sur RIDE 6 et F1 25.
+
+Ce que la phase 0 apprend pour la suite :
+- le lanceur wsquashfs exige que toute manette Sony de `/sys/class/hidraw`
+  soit ouvrable dans `/dev` (sinon GE-Proton ignore les manettes Sony) ;
+- la manette doit être branchée après le démarrage de SteamBox (`/sys` en
+  lecture seule, pas de rejeu d'uevent) ;
+- en phase 2, la DualSense `uhid` de Sunshine disparaît : plus de miroir ni
+  de leurre, mais le fil USB/IP ne doit jamais bloquer ;
+- hors session, la sortie DualSense devient la sortie par défaut (Sunshine
+  impose la sienne pendant une session).
+
 1. Écrire le serveur USB/IP **en C++**, sous forme d'un prototype autonome
    (sans Sunshine) dont le code passera tel quel dans libvirtualhid. Partir
    de vds : modèle de périphérique (`module/vds_usb_core.c`), profil
@@ -169,6 +259,15 @@ Si l'isochrone pose problème en USB/IP, ou si le conteneur ne peut pas voir
 les nouveaux périphériques, on s'arrête là et on réévalue (vds, gadget).
 
 ### Phase 1 — haptiques jusqu'au client
+
+**État (22/11)** : émetteur écrit, `--haptics-to IP:PORT`
+(`src/haptics_rtp.*`) : canaux 3-4 en RTP L16 stéréo big-endian 48 kHz,
+PT 127 (défaut des modules RTP de PipeWire), un paquet par milliseconde,
+DSCP EF. Vérifié par `tests/rtp_receiver_check.py` (séquence, horodatage,
+contenu). Côté client prévu : `module-rtp-source` de PipeWire (≥ 0.3.60,
+sans SAP : `source.port`, `audio.format S16BE`, `audio.position [ RL RR ]`,
+`sess.latency.msec` ~10), dirigé vers la sortie 4 canaux du dongle
+(firmware : 4 canaux reçus). Attente des infos du PC client.
 
 1. Le serveur extrait les canaux 3-4 et les envoie au PC client (RTP
    PipeWire `module-rtp-sink`/`-source`, ou UDP simple ; viser < 20 ms).
