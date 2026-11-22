@@ -79,7 +79,17 @@ Fichier `~/.config/pipewire/pipewire.conf.d/ds5-usbip-haptics.conf`
 
 Réglages utiles au quotidien, par priorité : gain des haptiques (serveur,
 à chaud), mode et Haptics Gain du dongle, marche/arrêt du renvoi
-`ds5-haptics-loopback`, tampon de réception (latence). Contrôles d'état :
+`ds5-haptics-loopback`, tampon de réception (latence).
+
+**Latence** (décidé le 22/11) : réglée par l'app plutôt que figée. Elle
+cumule le trajet réseau (~12 ms vers AIBox) et le tampon de réception
+(40 ms aujourd'hui). L'app peut chercher le minimum en chargeant à chaud un
+récepteur d'essai (`pw-cli load-module libpipewire-module-rtp-source`)
+avec un tampon décroissant, puis écrire la valeur retenue dans
+`ds5-usbip-haptics.conf` (application au prochain redémarrage de
+PipeWire, hors session Moonlight). En dessous du délai de la sortie du
+dongle, le récepteur ne joue que du silence (« Delay to device is higher
+than the target buffer size »). Contrôles d'état :
 manette branchée, flux haptique du jeu sur la bonne sortie, volumes à
 100 % des deux côtés, flux RTP reçu, niveaux par canal. Les réglages
 « volume à 100 % » et « sortie du flux » sont des corrections
