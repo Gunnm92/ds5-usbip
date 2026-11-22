@@ -580,6 +580,8 @@ bind RTSP server to port 48010 ». Un seul des deux à la fois.
    minimum qui joue encore (10 ms = silence le 22/11).
 8. Page « DualSense » de Sunshine : la rendre plus attrayante (mise en
    page, état en direct de la manette, retour visuel des réglages).
+   Libellé « Port vhci » ambigu (pris pour un port réseau) : le renommer,
+   par ex. « Emplacement USB (vhci) ».
 9. App compagnon (`docs/parametres.md`).
 
 ### Phase 3 — mise en production
