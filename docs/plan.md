@@ -545,6 +545,12 @@ rien au haut-parleur de la manette (mesuré : canaux 1-2 nuls) ; le
 bout le 22/11 (`RTP_CHANNELS=4 tests/rtp_test_pattern.py` depuis SteamBox :
 bips gauche/droite dans le haut-parleur, vibrations gauche/droite reçus).
 
+**Reprise (23/11)** : page « DualSense » et destination automatique en
+cours. Côté driver : fait et poussé (correctif 0003, ds5-usbip 7da3607).
+Côté Sunshine : correctifs de l'agent dans sunshine-ds (commits locaux,
+patches/sunshine/) à relire, puis `make build REQUIRE_USBIP=1`, release,
+`make push` SteamBox, test de la page sur http://<SteamBox>:47990.
+
 **Reste à faire :**
 1. SteamBox : commits poussés (22/11).
 2. Registre : réglé le 22/11 (`--insecure-registry=10.1.1.1:5003` dans
