@@ -541,7 +541,9 @@ F1 25, RIDE 6).
 client (pleine échelle) ; gâchettes, LED, vibration classique ; transport RTP
 2 ou 4 canaux (`LIBVIRTUALHID_DUALSENSE_RTP_CHANNELS=4`). F1 25 n'envoie
 rien au haut-parleur de la manette (mesuré : canaux 1-2 nuls) ; le
-4 canaux sert aux jeux qui l'utilisent.
+4 canaux sert aux jeux qui l'utilisent. Chaîne 4 canaux vérifiée de bout en
+bout le 22/11 (`RTP_CHANNELS=4 tests/rtp_test_pattern.py` depuis SteamBox :
+bips gauche/droite dans le haut-parleur, vibrations gauche/droite reçus).
 
 **Reste à faire :**
 1. SteamBox : commits locaux (17d8bac, d02c8c4, abacf14, 7d2e59c,
