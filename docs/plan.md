@@ -318,6 +318,35 @@ Pistes pour la reprise, dans l'ordre :
    hors dépôt, S16_LE 4 canaux 48 kHz, 220 s) en RTP vers le client, avec
    et sans gain, pour séparer « niveau » et « contenu ».
 
+**Reprise (22/11, 16 h 45)** : piste 1 confirmée. Les pics de tout
+l'enregistrement plafonnent à ~1 940 = -24,5 dB sous la pleine échelle,
+soit le volume de 40 % de la sortie DualSense de SteamBox : PipeWire
+atténue les haptiques (malgré `HARDWARE DECIBEL_VOLUME`). Relecture du
+passage 95-110 s en RTP (`tests/rtp_replay.py`) : ×1 rien, ×16 ressenti
+(léger). Corrigé à chaud : sortie à 100 % (`pactl set-sink-volume`,
+mémorisé par WirePlumber). À rendre durable (règle WirePlumber dans
+SteamBox : volume 1.0 pour la sortie 054c:0ce6, ou volume matériel seul).
+Seconde atténuation trouvée par l'utilisateur : `ds5_dongle_sink` sur
+AIBox était aussi à **40 % (-23,9 dB)** ; cumul -48 dB en jeu. Mise à
+100 % (à rendre durable côté AIBox : règle WirePlumber, volume 1.0).
+Relecture à volumes pleins : ressenti, mais faible. Firmware du dongle :
+`haptics_gain` appliqué aux canaux 3-4, borné à [1.0, 2.0] (portail
+« Haptics Gain », défaut 1.0), puis conversion int8 à 3 kHz. Au-delà :
+volume du flux > 100 % sur le client pour doser, puis `--haptics-gain`
+(écrêtage doux) dans le serveur.
+Réglages DS5Dongle-Studio relevés (22/11) : Mode Off ; les autres
+réglages visibles (Intensity, Noise Gate, Speaker Effect Leak…) ne
+concernent que l'auto-haptique et la fuite vers le haut-parleur ;
+« Haptics Gain » (1.0-2.0) à retrouver dans le portail. Relecture ×1 /
+×16 / ×32 envoyée, ressenti non noté. Firmware officiel (awalol) : même
+chemin natif (canaux 3-4 → 3 kHz → int8 × 127 × haptics_gain), donc pas
+plus fort ; garder Studio. Prochaine étape : `--haptics-gain` côté serveur,
+réglé au ressenti, puis rendre durables les volumes à 100 % (SteamBox et
+AIBox) et la config client.
+Le client avait aussi perdu sa config entre-temps (tampon resté à 10 ms,
+`ds5-haptics-loopback` revenu après rebranchement du dongle) : à rendre
+durable en phase 3 (paquet AIBox).
+
 État des lieux au point d'arrêt :
 - SteamBox : serveur `/tmp/ds5-usbip-proto -a 127.0.0.1 -m auto
   --hide-mirror -t 10.10.10.1:46100 -d /tmp/ds5-audio.raw` (lancé par exec,
