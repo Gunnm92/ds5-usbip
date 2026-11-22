@@ -75,6 +75,33 @@ La voie gadget USB (`dummy_hcd` + `libcomposite`) et le module dédié
 [vds](https://github.com/hurryman2212/vds) (`vds_hcd`) demanderaient de
 compiler un module pour le noyau Unraid : écartés tant que USB/IP suffit.
 
+### Ce qu'on reprend de vds (MIT)
+
+[vds](https://github.com/hurryman2212/vds) émule déjà la DualSense USB
+voulue — interface HID + carte son UAC1 **4 canaux, 48 kHz, S16_LE**
+(canaux 0-1 haut-parleur, 2-3 haptiques, en numérotation à partir de 0) —
+et l'exporte **par USB/IP sous Windows** (usbip-win2,
+`usbip://127.0.0.1:3240/1-1`) : le modèle de périphérique est donc éprouvé à
+travers USB/IP, isochrone compris. Sous Linux il utilise son propre HCD
+uniquement parce que `dummy_hcd` ne gère pas l'isochrone ; `vhci-hcd`, lui,
+le gère.
+
+À porter en Go (avec crédit, licence MIT) :
+
+- descripteurs et profil : `module/dualsense.c`, `module/vds_controller.h`,
+  `include/vds/ds5_protocol.h`, `include/uapi/vds.h` ;
+- modèle de périphérique USB et requêtes de classe HID / UAC1 (muet,
+  volume en 8.8 dB de -100 à 0 dB) : `module/vds_usb_core.c` ;
+- intervalles des points de terminaison HID : 4 ms en entrée et en sortie
+  (DualSense) ;
+- côté Windows, son export USB/IP (`src/platform/`) : à lire pour la gestion
+  de l'isochrone avant d'écrire la nôtre.
+
+Ce qu'on ne reprend pas : la partie Bluetooth (vds pilote une vraie
+DualSense par L2CAP et convertit les haptiques en rapports Bluetooth, code
+dérivé de DS5Dongle d'awalol). Ici la source est la manette de Sunshine, et
+les haptiques partent en PCM brut vers le DS5Dongle du client.
+
 ## 4. Architecture cible
 
 ```
@@ -115,10 +142,10 @@ et un conteneur Wine.
    `iso_packet_descriptor` géré directement. Commencer par le contrôle
    (descripteurs, `SET_CONFIGURATION`, `SET_INTERFACE`), puis l'interruption
    (HID), puis l'isochrone (audio).
-2. Prototype : descripteurs d'une DualSense USB (`054c:0ce6`) recopiés d'une
-   vraie manette (`lsusb -v` côté client, ou descripteurs de libvirtualhid
-   pour le HID) : interface HID + interfaces audio UAC1 (sortie 4 canaux
-   48 kHz 16 bits, entrée micro 2 canaux en option).
+2. Prototype : descripteurs d'une DualSense USB (`054c:0ce6`) portés depuis
+   vds (`module/dualsense.c`, voir section 3), à recouper si besoin avec une
+   vraie manette (`lsusb -v` côté client) : interface HID + interfaces audio
+   UAC1 (sortie 4 canaux 48 kHz S16_LE, entrée micro en option).
 3. Sur l'hôte : `modprobe vhci-hcd snd-usb-audio` (à la main, par
    l'utilisateur), `usbip attach -r 127.0.0.1 -b <busid>`.
 4. Dans le conteneur : vérifier la carte son (`aplay -l`, sortie PipeWire
