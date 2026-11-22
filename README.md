@@ -10,6 +10,8 @@ un vrai périphérique USB (HID + carte son 4 canaux, branchée par
 `vhci-hcd`) règle les deux ; ses canaux haptiques partent ensuite vers le PC
 client et le DS5Dongle.
 
-Écrit en Go (serveur USB/IP fait maison, transferts isochrones compris).
+Cible : un backend USB/IP intégré à Sunshine (libvirtualhid, C++), à
+partir du code de [vds](https://github.com/hurryman2212/vds) (MIT) ; la
+phase 0 est un prototype C++ autonome.
 
 **État : plan, pas encore de code.** Voir [docs/plan.md](docs/plan.md).

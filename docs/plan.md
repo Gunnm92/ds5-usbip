@@ -6,6 +6,14 @@ vraie manette du client Moonlight.
 Rédigé le 22/11/2026, à partir des essais en direct de la session SteamBox
 du 21-22/11. Démarrage prévu le 23/11.
 
+**Décision (22/11)** : la DualSense USB/IP sera **intégrée à Sunshine**
+(nouveau backend de libvirtualhid, C++), pour supprimer une couche : une
+seule manette, pas de pont entre la DualSense `uhid` et une DualSense USB, et
+le cycle de vie de la session Moonlight gratuit. Le prototype de la phase 0
+est écrit en C++ sur la base du code de vds, pour devenir ensuite le cœur de
+ce backend. (Une version Go autonome avait d'abord été envisagée : écartée,
+elle imposait le pont et ses deux manettes.)
+
 ## 1. Le problème
 
 Une DualSense branchée en USB reçoit ses **haptiques HD comme un son** : sa
@@ -86,7 +94,7 @@ travers USB/IP, isochrone compris. Sous Linux il utilise son propre HCD
 uniquement parce que `dummy_hcd` ne gère pas l'isochrone ; `vhci-hcd`, lui,
 le gère.
 
-À porter en Go (avec crédit, licence MIT) :
+À reprendre en C++ (avec crédit, licence MIT) :
 
 - descripteurs et profil : `module/dualsense.c`, `module/vds_controller.h`,
   `include/vds/ds5_protocol.h`, `include/uapi/vds.h` ;
@@ -108,7 +116,7 @@ les haptiques partent en PCM brut vers le DS5Dongle du client.
 Moonlight (manette du client)
         │ entrées, gâchettes, LED…
         ▼
-Sunshine ──► DualSense émulée (serveur USB/IP, ce projet)
+Sunshine ──► DualSense émulée (backend USB/IP de libvirtualhid, ce projet)
                  │  vhci-hcd (hôte) : vrai périphérique USB
                  ├─ interface HID  ─► jeux / Wine (manette)
                  └─ interface audio (UAC, 4 canaux 48 kHz)
@@ -133,15 +141,16 @@ fois le critère atteint.
 But : prouver qu'une DualSense USB émulée en USB/IP obtient une carte son
 et un conteneur Wine.
 
-1. Écrire le serveur USB/IP **en Go** (choix du 22/11 : binaire unique,
-   cohérent avec wsquashfs-launcher). Le protocole est simple et se code
-   sans bibliothèque : `OP_REQ_DEVLIST`, `OP_REQ_IMPORT`, puis
-   `USBIP_CMD_SUBMIT` / `USBIP_RET_SUBMIT` / `USBIP_CMD_UNLINK`, en-têtes
-   big-endian sur TCP (port 3240). L'écrire nous-mêmes règle le risque des
-   **transferts isochrones** (indispensables à l'audio USB) : tableau
-   `iso_packet_descriptor` géré directement. Commencer par le contrôle
-   (descripteurs, `SET_CONFIGURATION`, `SET_INTERFACE`), puis l'interruption
-   (HID), puis l'isochrone (audio).
+1. Écrire le serveur USB/IP **en C++**, sous forme d'un prototype autonome
+   (sans Sunshine) dont le code passera tel quel dans libvirtualhid. Partir
+   de vds : modèle de périphérique (`module/vds_usb_core.c`), profil
+   DualSense, et son export USB/IP Windows (`src/platform/`). Le protocole
+   est simple : `OP_REQ_DEVLIST`, `OP_REQ_IMPORT`, puis `USBIP_CMD_SUBMIT` /
+   `USBIP_RET_SUBMIT` / `USBIP_CMD_UNLINK`, en-têtes big-endian sur TCP
+   (port 3240). Gérer nous-mêmes les **transferts isochrones**
+   (indispensables à l'audio USB) : tableau `iso_packet_descriptor`.
+   Commencer par le contrôle (descripteurs, `SET_CONFIGURATION`,
+   `SET_INTERFACE`), puis l'interruption (HID), puis l'isochrone (audio).
 2. Prototype : descripteurs d'une DualSense USB (`054c:0ce6`) portés depuis
    vds (`module/dualsense.c`, voir section 3), à recouper si besoin avec une
    vraie manette (`lsusb -v` côté client) : interface HID + interfaces audio
@@ -170,19 +179,22 @@ les nouveaux périphériques, on s'arrête là et on réévalue (vds, gadget).
 
 **Critère** : haptiques ressenties dans RIDE 6, sans vibration permanente.
 
-### Phase 2 — intégration avec Sunshine
+### Phase 2 — intégration dans Sunshine (choix du 22/11)
 
-Deux options, à trancher après la phase 0 :
+Nouveau backend USB/IP dans libvirtualhid : Sunshine crée directement la
+DualSense USB/IP à la place de la DualSense `uhid` (profil `"ds5"`).
+Sunshine est déjà compilé dans l'image SteamBox (étape `sunshine-usb` du
+Dockerfile) : le correctif rejoint cette étape. Les rapports d'entrée
+(Moonlight → jeu) et de sortie (vibration, gâchettes adaptatives, LED : jeu
+→ Moonlight) passent par le même chemin qu'aujourd'hui, seul le transport
+change. Les canaux haptiques de la carte son partent vers le client
+(phase 1).
 
-- **A. Sunshine crée la DualSense USB/IP** : nouveau profil/backend dans
-  libvirtualhid (Sunshine est déjà compilé dans l'image, étape
-  `sunshine-usb` du Dockerfile). Propre, une seule manette.
-- **B. Pont** : la DualSense `uhid` de Sunshine reste, ce projet recopie ses
-  rapports d'entrée vers la DualSense USB et renvoie les rapports de sortie
-  du jeu (vibration, gâchettes, LED) vers elle pour que Sunshine les
-  transmette. Il faut alors cacher la manette `uhid` aux jeux (sinon deux
-  DualSense). Modèle existant : `dualsense-usb-bridge` de
-  wsquashfs-launcher.
+Points à prévoir : attacher la manette par `vhci-hcd` depuis le conteneur
+(écriture dans `/sys/devices/platform/vhci_hcd.0/attach` ou `usbip attach`,
+droits à vérifier) à chaque connexion, la détacher à la déconnexion ; repli
+sur `uhid` si `vhci-hcd` est absent ; correctif assez lourd à réappliquer à
+chaque version de Sunshine (à proposer à LizardByte une fois stable).
 
 **Critère** : une seule DualSense vue par les jeux, entrées, gâchettes
 adaptatives, LED et vibration classique toujours fonctionnelles, haptiques
