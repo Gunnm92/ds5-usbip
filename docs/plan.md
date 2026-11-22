@@ -546,11 +546,8 @@ rien au haut-parleur de la manette (mesuré : canaux 1-2 nuls) ; le
 **Reste à faire :**
 1. SteamBox : commits locaux (17d8bac, d02c8c4, abacf14, 7d2e59c,
    f958479 annulé) à pousser à la fin du projet, sur accord.
-2. Registre : le téléchargement par Unraid passe par le NAT en boucle
-   (lent). Choix à faire : `--insecure-registry=10.1.1.1:5003` dans
-   `/boot/config/docker.cfg` + modèle sur `10.1.1.1:5003/steambox:latest`
-   (recommandé), ou `registry.elfenn.eu:18443` + résolution locale
-   (Nginx Proxy Manager écoute en 18443, le 443 d'Unraid sert `nas.local`).
+2. Registre : réglé le 22/11 (`--insecure-registry=10.1.1.1:5003` dans
+   `/boot/config/docker.cfg`, modèle sur `10.1.1.1:5003/steambox:latest`).
 3. Fichier `go` d'Unraid : `modprobe vhci-hcd snd-usb-audio` avant Docker
    (sans vhci-hcd, le montage manque et SteamBox ne démarre pas).
 4. AIBox (projet AIBox, guide : `docs/aibox.md`) : récepteur RTP 4 canaux, volume
