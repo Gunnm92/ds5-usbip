@@ -13,7 +13,7 @@ jeu (Wine) ─► sortie DualSense ─► ds5-usbip ─RTP─► module-rtp-sour
 
 | Réglage | Valeur actuelle | Plage / choix | Comment | À chaud |
 |---|---|---|---|---|
-| **Gain des haptiques** | ×2 | 0 < g ≤ 64 ; écrêtage doux au-delà de la moitié de la pleine échelle | `--haptics-gain G`, ou fichier `--haptics-gain-file /tmp/ds5-haptics-gain` (un nombre, relu chaque seconde) | **oui** (fichier) |
+| **Gain des haptiques** | ×1 (fidèle au jeu) | 0 < g ≤ 64 ; écrêtage doux au-delà de la moitié de la pleine échelle | `--haptics-gain G`, ou fichier `--haptics-gain-file /tmp/ds5-haptics-gain` (un nombre, relu chaque seconde) | **oui** (fichier) |
 | Destination RTP | `10.10.10.1:46100` | `IP:PORT` du PC client | `--haptics-to` | non (redémarrage = manette débranchée) |
 | Journal détaillé | coupé | marche / arrêt | `-v`, ou signal `SIGUSR1` (bascule) | **oui** (signal) |
 | Enregistrement PCM | `/tmp/ds5-audio.raw` | fichier S16_LE 4 canaux 48 kHz | `-d FICHIER` | non |
@@ -78,7 +78,8 @@ Fichier `~/.config/pipewire/pipewire.conf.d/ds5-usbip-haptics.conf`
 ## Pour l'app compagnon
 
 Réglages utiles au quotidien, par priorité : gain des haptiques (serveur,
-à chaud), mode et Haptics Gain du dongle, marche/arrêt du renvoi
+à chaud ; ×1 = niveau d'origine du jeu, comme une vraie DualSense en USB,
+au-delà = préférence personnelle), mode et Haptics Gain du dongle, marche/arrêt du renvoi
 `ds5-haptics-loopback`, tampon de réception (latence).
 
 **Latence** (décidé le 22/11) : réglée par l'app plutôt que figée. Elle

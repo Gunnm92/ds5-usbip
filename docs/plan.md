@@ -367,8 +367,9 @@ après un rebranchement de la manette émulée pendant que le jeu tournait,
 son flux haptique 4 canaux (« PipeWire ALSA [wine64-preloader] ») était
 resté sur la sortie par défaut (Sunshine 5.1 : canaux 3-4 sur FC/LFE,
 « petits bruits » dans le son du jeu) ; remis sur la DualSense par
-`pactl move-sink-input`. Gain à l'émission ×2 (`--haptics-gain-file
-/tmp/ds5-haptics-gain`, réglable à chaud).
+`pactl move-sink-input`. Gain à l'émission ramené à ×1 (`--haptics-gain-file
+/tmp/ds5-haptics-gain`, réglable à chaud) : avec les volumes à 100 %, le
+niveau d'origine du jeu est le bon ; plus fort = préférence (app compagnon).
 
 Gâchettes adaptatives : OK dans F1 25. Dans RIDE 6, le journal décodé
 montre que le jeu n'envoie qu'un « effet désactivé » (mode 0x05) : RIDE 6
@@ -385,7 +386,7 @@ Recette qui marche aujourd'hui (à automatiser en phases 2-3) :
 (règle WirePlumber SteamBox : fait, `52-ds5-usbip.conf`, commit local
 f958479, entrera au prochain `make push`) ; côté AIBox, volume du dongle, config RTP et
 désactivation du loopback quand ds5-usbip est utilisé (dépôt AIBox) ;
-réglage final du gain ; réduction de la latence (~50 ms).
+réduction de la latence (~50 ms, par l'app compagnon).
 
 ### À faire dans le projet AIBox (client)
 
