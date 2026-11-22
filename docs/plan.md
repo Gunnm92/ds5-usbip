@@ -546,16 +546,13 @@ bout le 22/11 (`RTP_CHANNELS=4 tests/rtp_test_pattern.py` depuis SteamBox :
 bips gauche/droite dans le haut-parleur, vibrations gauche/droite reçus).
 
 **Reste à faire :**
-1. SteamBox : commits locaux (17d8bac, d02c8c4, abacf14, 7d2e59c,
-   f958479 annulé) à pousser à la fin du projet, sur accord.
+1. SteamBox : commits poussés (22/11).
 2. Registre : réglé le 22/11 (`--insecure-registry=10.1.1.1:5003` dans
    `/boot/config/docker.cfg`, modèle sur `10.1.1.1:5003/steambox:latest`).
 3. Fichier `go` d'Unraid : `modprobe vhci-hcd snd-usb-audio` avant Docker
    (sans vhci-hcd, le montage manque et SteamBox ne démarre pas).
-4. AIBox (projet AIBox, guide : `docs/aibox.md`) : récepteur RTP 4 canaux, volume
-   du dongle à 100 %, loopback désactivé, persistance, et verrouillage du
-   récepteur sur le dongle (dont-reconnect / dont-fallback cassent la
-   liaison).
+4. AIBox : intégration faite dans son projet (22/11), d'après
+   `docs/aibox.md`.
 5. Grésillements à pleine échelle (actionneurs ou conversion 8 bits du
    dongle) : gain d'émission (`LIBVIRTUALHID_DUALSENSE_HAPTICS_GAIN`) ou
    filtre du dongle, au ressenti.
