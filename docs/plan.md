@@ -388,6 +388,16 @@ f958479, entrera au prochain `make push`) ; côté AIBox, volume du dongle, conf
 désactivation du loopback quand ds5-usbip est utilisé (dépôt AIBox) ;
 réduction de la latence (~50 ms, par l'app compagnon).
 
+Corrections finales avant la phase 2 (22/11, 18 h) :
+- flux haptique du jeu : Wine le crée avec `target.object` = nom stable de
+  la sortie DualSense ; rebranchée en plein jeu, WirePlumber l'y remet seul
+  (vérifié sur F1 25). Il n'atterrit sur la sortie par défaut que si le jeu
+  démarre **avant** la manette (Wine ne la désigne alors pas) : en phase 2,
+  Sunshine crée la manette à l'ouverture de session, avant le jeu ;
+- nœuds `/dev/hidraw` périmés : règle udev de suppression au « remove »
+  (SteamBox, commit local) ; vérifié au rebranchement ;
+- gain des haptiques ramené à ×1 (niveau d'origine du jeu).
+
 ### À faire dans le projet AIBox (client)
 
 Décidé le 22/11 : à traiter directement dans le dépôt AIBox, pas ici.
