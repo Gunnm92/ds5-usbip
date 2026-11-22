@@ -382,9 +382,26 @@ Recette qui marche aujourd'hui (à automatiser en phases 2-3) :
   100 %, `ds5-haptics-loopback` arrêté, dongle en mode « Off ».
 
 À rendre durable : volume 100 % et priorité basse de la sortie DualSense
-(règle WirePlumber SteamBox) ; côté AIBox, volume du dongle, config RTP et
+(règle WirePlumber SteamBox : fait, `52-ds5-usbip.conf`, commit local
+f958479, entrera au prochain `make push`) ; côté AIBox, volume du dongle, config RTP et
 désactivation du loopback quand ds5-usbip est utilisé (dépôt AIBox) ;
 réglage final du gain ; réduction de la latence (~50 ms).
+
+### À faire dans le projet AIBox (client)
+
+Décidé le 22/11 : à traiter directement dans le dépôt AIBox, pas ici.
+
+1. Sortie du dongle à 100 % dès son apparition : ajouter
+   `device.routes.default-sink-volume = 1.0` pour la carte du dongle dans
+   `51-ds5dongle.conf` (à 40 %, les haptiques perdaient 24 dB).
+2. Réception RTP : intégrer `client/pipewire/ds5-usbip-haptics.conf`
+   (tampon 40 ms, `[ RL RR ]`, port 46100) à l'image.
+3. `ds5-haptics-loopback` (vibration tirée du son, dongle en « Replace »)
+   et ds5-usbip (haptiques natives, dongle en « Off ») s'excluent : le
+   service relancé par udev à chaque reconnexion du dongle renvoie le son
+   du jeu dans le haut-parleur de la manette. Choisir : ds5-usbip seul,
+   ou bascule entre les deux (mode du dongle compris, piste pour l'app
+   compagnon, voir `docs/parametres.md`).
 
 ### Phase 2 — intégration dans Sunshine (choix du 22/11)
 
