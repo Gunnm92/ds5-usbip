@@ -274,6 +274,14 @@ qui renvoie le son du jeu sur AUX0/AUX1 (vibration « auto », la vibration
 permanente). Haptiques natives = AUX2/AUX3. Config client :
 `client/pipewire/ds5-usbip-haptics.conf` (port 46100). SteamBox → AIBox
 (10.10.10.x) : 25 ms aller-retour, à surveiller pour la latence.
+Mise au point (22/11) : profil « Direct » du dongle = canaux FL FR RL RR
+(pas AUX), d'où `audio.position [ RL RR ]`. Paquets bien reçus (test UDP
+3 000/3 000), mais rien joué : à `sess.latency.msec = 10`, tampon plus
+court que le délai de la sortie du dongle, module-rtp-source le ramène à 0
+et ne joue que du silence. À 40 ms : vibration de test
+(`tests/rtp_test_pattern.py`) ressentie. Latence totale ~50 ms : à réduire
+(mesurer le délai réel de la sortie). Attention : redémarrer PipeWire sur
+le client coupe le son de Moonlight (quitter la session avant).
 
 1. Le serveur extrait les canaux 3-4 et les envoie au PC client (RTP
    PipeWire `module-rtp-sink`/`-source`, ou UDP simple ; viser < 20 ms).
@@ -283,6 +291,45 @@ permanente). Haptiques natives = AUX2/AUX3. Config client :
    manette.
 
 **Critère** : haptiques ressenties dans RIDE 6, sans vibration permanente.
+
+**Point d'arrêt (22/11, 14 h)** — la chaîne fonctionne avec la vibration
+de test (sinus 80 Hz, amplitude 20 000), mais **en jeu (RIDE 6, tampon
+40 ms) l'utilisateur ne sent pas de différence**, alors que le jeu envoie
+bien ses haptiques (21 s sur 40 avec signal, émises en RTP).
+
+Pistes pour la reprise, dans l'ordre :
+1. **Niveau du signal.** Haptiques du jeu faibles : pics 500-2 000,
+   -35 à -56 dB RMS (test : 20 000). La sortie DualSense de SteamBox est à
+   **40 % (-23,9 dB)**, volume matériel (`HARDWARE DECIBEL_VOLUME`, unité de
+   fonction UAC du périphérique émulé, que le serveur ignore) : vérifier
+   que PipeWire n'atténue pas en plus en logiciel (mesurer les pics à 40 %
+   puis à 100 %). Une vraie DualSense applique ce volume au haut-parleur
+   seulement (vds : gain sur les canaux 0-1). Si besoin, gain réglable à
+   l'émission (`--haptics-gain`) et rejouer l'enregistrement RIDE 6 vers le
+   client pour comparer au ressenti.
+2. **Conversion du dongle.** Il ramène les haptiques à 3 kHz pour le
+   Bluetooth (rapports 0x36, échantillons 8 bits dans vds/DS5Dongle) : un
+   signal à -45 dB n'y laisse que quelques pas de quantification. Lire le
+   code de DS5Dongle-Studio (mode « Off », gain éventuel).
+3. **Latence.** ~50 ms (40 ms de tampon + ~12 ms de réseau) : mesurer le
+   délai réel de la sortie du dongle (`pw-top`, propriétés de latence du
+   nœud) et descendre le tampon au minimum qui joue encore.
+4. Rejouer l'enregistrement RIDE 6 (`/config/workspace/ride6-haptics-20261122.raw`,
+   hors dépôt, S16_LE 4 canaux 48 kHz, 220 s) en RTP vers le client, avec
+   et sans gain, pour séparer « niveau » et « contenu ».
+
+État des lieux au point d'arrêt :
+- SteamBox : serveur `/tmp/ds5-usbip-proto -a 127.0.0.1 -m auto
+  --hide-mirror -t 10.10.10.1:46100 -d /tmp/ds5-audio.raw` (lancé par exec,
+  à relancer après un redémarrage du conteneur ; binaire copié par le
+  partage Game). Manette émulée branchée (port 0) ; tout redémarrage du
+  serveur la débranche (`ds5-usbip-attach attach 127.0.0.1` sur l'hôte).
+- AIBox : `~/.config/pipewire/pipewire.conf.d/ds5-usbip-haptics.conf`
+  (commit b431621, tampon 40 ms, RL/RR) ; `ds5-haptics-loopback` arrêté
+  (reviendra au prochain branchement du dongle) ; dongle en mode « Off ».
+- Hors session de test : débrancher la manette émulée (`ds5-usbip-attach
+  detach 0`), sinon seconde DualSense et sortie son par défaut dans
+  SteamBox.
 
 ### Phase 2 — intégration dans Sunshine (choix du 22/11)
 
