@@ -267,7 +267,13 @@ DSCP EF. Vérifié par `tests/rtp_receiver_check.py` (séquence, horodatage,
 contenu). Côté client prévu : `module-rtp-source` de PipeWire (≥ 0.3.60,
 sans SAP : `source.port`, `audio.format S16BE`, `audio.position [ RL RR ]`,
 `sess.latency.msec` ~10), dirigé vers la sortie 4 canaux du dongle
-(firmware : 4 canaux reçus). Attente des infos du PC client.
+(firmware : 4 canaux reçus).
+Client = AIBox (PipeWire 1.6.11). Sa config DS5Dongle-Studio : sortie
+pro-audio `ds5_dongle_sink` (AUX0-AUX3), service `ds5-haptics-loopback`
+qui renvoie le son du jeu sur AUX0/AUX1 (vibration « auto », la vibration
+permanente). Haptiques natives = AUX2/AUX3. Config client :
+`client/pipewire/ds5-usbip-haptics.conf` (port 46100). SteamBox → AIBox
+(10.10.10.x) : 25 ms aller-retour, à surveiller pour la latence.
 
 1. Le serveur extrait les canaux 3-4 et les envoie au PC client (RTP
    PipeWire `module-rtp-sink`/`-source`, ou UDP simple ; viser < 20 ms).
