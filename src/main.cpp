@@ -10,6 +10,7 @@
 #include <sys/sysmacros.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -322,6 +323,37 @@ namespace {
     bool out_stop_ = false;
   };
 
+  // Journal détaillé : rapport de sortie USB 0x02 affiché quand il change,
+  // avec les champs utiles décodés (offsets avec l'octet de numéro) :
+  // 1-2 drapeaux de validité (bit 0x04 / 0x08 du 1er : gâchette droite /
+  // gauche), 3-4 vibration droite / gauche, 11 mode de la gâchette droite,
+  // 22 mode de la gauche.
+  void log_output_report(std::span<const std::uint8_t> r) {
+    static std::vector<std::uint8_t> last;
+    static std::size_t same = 0;
+    if (std::equal(r.begin(), r.end(), last.begin(), last.end())) {
+      ++same;
+      return;
+    }
+    last.assign(r.begin(), r.end());
+    std::string hex;
+    char b[4];
+    for (const auto c : r) {
+      std::snprintf(b, sizeof(b), "%02x", c);
+      hex += b;
+    }
+    if (r.size() >= 23 && r[0] == 0x02) {
+      std::fprintf(
+        stderr,
+        "hid: sortie (après %zu identiques) flags %02x %02x vib D %3u G %3u | gâchette D mode %02x G mode %02x | %s\n",
+        same, r[1], r[2], r[3], r[4], r[11], r[22], hex.c_str()
+      );
+    } else {
+      std::fprintf(stderr, "hid: sortie 0x%02x %zu octets | %s\n", r[0], r.size(), hex.c_str());
+    }
+    same = 0;
+  }
+
   void usage(const char *argv0) {
     std::printf(
       "Usage : %s [options]\n"
@@ -447,7 +479,7 @@ int main(int argc, char **argv) {
     .output_report =
       [&mirror](std::span<const std::uint8_t> r) {
         if (g_verbose.load()) {
-          std::fprintf(stderr, "hid: rapport de sortie 0x%02x, %zu octets\n", r[0], r.size());
+          log_output_report(r);
         }
         mirror.output(r);
       },
