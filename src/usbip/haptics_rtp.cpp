@@ -6,16 +6,138 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <format>
+#include <optional>
 #include <random>
+#include <string>
 #include <vector>
 
 namespace ds5usbip {
+
+  namespace {
+
+    constexpr float kMaxGain = 64.0F;
+
+    /** @brief Removes leading and trailing spaces, tabs and line breaks. */
+    std::string_view trim(std::string_view text) {
+      constexpr std::string_view spaces = " \t\r\n";
+      const auto first = text.find_first_not_of(spaces);
+      if (first == std::string_view::npos) {
+        return {};
+      }
+      const auto last = text.find_last_not_of(spaces);
+      return text.substr(first, last - first + 1);
+    }
+
+    /** @brief Parses a whole string as a float; nullopt on trailing text or a non-number. */
+    std::optional<float> parse_number(std::string_view text) {
+      const std::string copy {text};
+      char *end = nullptr;
+      const float value = std::strtof(copy.c_str(), &end);
+      if (copy.empty() || end != copy.c_str() + copy.size()) {
+        return std::nullopt;
+      }
+      return value;
+    }
+
+    /** @brief Gain range accepted in settings and gain files: 0 < g <= 64. */
+    bool valid_gain(float gain) {
+      return gain > 0.0F && gain <= kMaxGain;
+    }
+
+  }  // namespace
+
+  HapticsSettings parse_haptics_settings(std::string_view text) {
+    HapticsSettings settings;
+    while (!text.empty()) {
+      const auto newline = text.find('\n');
+      auto line = text.substr(0, newline);
+      text = newline == std::string_view::npos ? std::string_view {} : text.substr(newline + 1);
+
+      line = line.substr(0, line.find('#'));
+      const auto equal = line.find('=');
+      if (equal == std::string_view::npos) {
+        continue;
+      }
+      const auto key = trim(line.substr(0, equal));
+      const auto value = trim(line.substr(equal + 1));
+      if (key == "gain") {
+        if (const auto gain = parse_number(value); gain && valid_gain(*gain)) {
+          settings.gain = gain;
+        }
+      } else if (key == "channels") {
+        if (value == "2") {
+          settings.channels = 2U;
+        } else if (value == "4") {
+          settings.channels = 4U;
+        }
+      }
+    }
+    return settings;
+  }
+
+  HapticsSettings load_haptics_settings(const std::string &path) {
+    std::FILE *f = std::fopen(path.c_str(), "r");
+    if (!f) {
+      return {};
+    }
+    std::string text;
+    std::array<char, 512> buffer {};
+    std::size_t count = 0;
+    while ((count = std::fread(buffer.data(), 1, buffer.size(), f)) > 0) {
+      text.append(buffer.data(), count);
+    }
+    std::fclose(f);
+    return parse_haptics_settings(text);
+  }
+
+  std::optional<float> parse_gain_text(std::string_view text) {
+    while (!text.empty()) {
+      const auto newline = text.find('\n');
+      auto line = trim(text.substr(0, newline));
+      text = newline == std::string_view::npos ? std::string_view {} : text.substr(newline + 1);
+
+      line = trim(line.substr(0, line.find('#')));
+      if (line.empty()) {
+        continue;
+      }
+      std::optional<float> gain;
+      if (const auto equal = line.find('='); equal == std::string_view::npos) {
+        gain = parse_number(line);
+      } else if (trim(line.substr(0, equal)) == "gain") {
+        gain = parse_number(trim(line.substr(equal + 1)));
+      }
+      if (gain && valid_gain(*gain)) {
+        return gain;
+      }
+    }
+    return std::nullopt;
+  }
+
+  bool write_text_atomically(const std::string &path, std::string_view text) {
+    const auto temporary = path + ".tmp";
+    std::FILE *f = std::fopen(temporary.c_str(), "w");
+    if (!f) {
+      return false;
+    }
+    const bool written = std::fwrite(text.data(), 1, text.size(), f) == text.size();
+    const bool closed = std::fclose(f) == 0;
+    if (!written || !closed) {
+      static_cast<void>(std::remove(temporary.c_str()));
+      return false;
+    }
+    if (std::rename(temporary.c_str(), path.c_str()) != 0) {
+      static_cast<void>(std::remove(temporary.c_str()));
+      return false;
+    }
+    return true;
+  }
 
   HapticsRtpSender::HapticsRtpSender(LogFn log):
       log_(std::move(log)) {}
@@ -67,10 +189,10 @@ namespace ds5usbip {
   }
 
   void HapticsRtpSender::set_gain(float gain, std::string gain_file) {
-    gain_ = gain > 0 ? gain : 1.0f;
+    gain_.store(gain > 0 ? gain : 1.0f, std::memory_order_relaxed);
     gain_file_ = std::move(gain_file);
     reload_gain();
-    log(std::format("haptiques : gain ×{:.2f}{}{}", gain_, gain_file_.empty() ? "" : ", réglable dans ", gain_file_));
+    log(std::format("haptiques : gain ×{:.2f}{}{}", gain_.load(std::memory_order_relaxed), gain_file_.empty() ? "" : ", réglable dans ", gain_file_));
   }
 
   void HapticsRtpSender::reload_gain() {
@@ -81,12 +203,18 @@ namespace ds5usbip {
     if (!f) {
       return;
     }
-    float g = 0;
-    if (std::fscanf(f, "%f", &g) == 1 && g > 0 && g <= 64 && g != gain_) {
-      gain_ = g;
-      log(std::format("haptiques : gain ×{:.2f}", gain_));
+    std::string text;
+    std::array<char, 256> buffer {};
+    std::size_t count = 0;
+    while ((count = std::fread(buffer.data(), 1, buffer.size(), f)) > 0) {
+      text.append(buffer.data(), count);
     }
     std::fclose(f);
+    const auto g = parse_gain_text(text);
+    if (g && *g != gain_.load(std::memory_order_relaxed)) {
+      gain_.store(*g, std::memory_order_relaxed);
+      log(std::format("haptiques : gain ×{:.2f}", *g));
+    }
   }
 
   // Gain, then soft clipping: linear up to half of full scale, then a tanh
@@ -135,13 +263,14 @@ namespace ds5usbip {
     // S16_LE -> S16_BE. 2 channels: haptics (input channels 2-3) with gain.
     // 4 channels: speaker (0-1) unchanged, then haptics (2-3) with gain.
     const unsigned first = channels_ == 4 ? 0 : 2;
+    const float gain = gain_.load(std::memory_order_relaxed);
     for (std::size_t f = 0; f < frames; ++f) {
       const std::uint8_t *in = pcm4ch.data() + f * kInFrame;
       std::uint8_t *out = pkt.data() + 12 + f * out_frame;
       for (unsigned c = first, o = 0; c < 4; ++c, ++o) {
         auto s = static_cast<std::int16_t>(in[2 * c] | (in[2 * c + 1] << 8));
         if (c >= 2) {
-          s = shape(s, gain_);
+          s = shape(s, gain);
         }
         const auto v = static_cast<std::uint16_t>(s);
         out[2 * o] = static_cast<std::uint8_t>(v >> 8);
@@ -151,7 +280,7 @@ namespace ds5usbip {
     ::sendto(fd_, pkt.data(), pkt.size(), MSG_DONTWAIT, reinterpret_cast<const sockaddr *>(&dest_), sizeof(dest_));
     ++seq_;
     timestamp_ += static_cast<std::uint32_t>(frames);
-    ++packets_;
+    packets_.fetch_add(1, std::memory_order_relaxed);
   }
 
 }  // namespace ds5usbip

@@ -1,0 +1,575 @@
+From 2f634731d995f0bf99fe413bf0037f68c018c5ea Mon Sep 17 00:00:00 2001
+From: Gunnm92 <gunnm44@gmail.com>
+Date: Sun, 22 Nov 2026 23:51:06 +0100
+Subject: [PATCH] feat(linux): DualSense USB/IP haptics destination, settings
+ and status files
+
+- GamepadMetadata::haptics_destination: host-chosen RTP destination; wins over
+  LIBVIRTUALHID_DUALSENSE_HAPTICS_RTP when non-empty.
+- LIBVIRTUALHID_DUALSENSE_SETTINGS: key=value file (gain, channels) that
+  overrides the gain and channel environment variables; without a gain file
+  variable it is also the hot-reloaded gain file.
+- LIBVIRTUALHID_DUALSENSE_STATUS: JSON status rewritten about once per second
+  while attached (atomic rename), with a closing record on close().
+- Tests: destination precedence, settings overrides, invalid settings, status
+  record layout and closing record.
+
+Co-Authored-By: Claude Haiku 5.5 <noreply@anthropic.com>
+---
+ src/include/libvirtualhid/types.hpp           |   3 +
+ src/platform/linux/uhid_backend.cpp           | 194 ++++++++++++++++--
+ .../fixtures/linux_backend_test_hooks.hpp     |  28 +++
+ tests/fixtures/linux_backend_test_hooks.cpp   | 143 +++++++++++++
+ tests/unit/test_linux_backend.cpp             |  51 +++++
+ 5 files changed, 401 insertions(+), 18 deletions(-)
+
+diff --git a/src/include/libvirtualhid/types.hpp b/src/include/libvirtualhid/types.hpp
+index 3cc6601..114a6a6 100644
+--- a/src/include/libvirtualhid/types.hpp
++++ b/src/include/libvirtualhid/types.hpp
+@@ -428,6 +428,9 @@ namespace lvh {
+      * @brief Consumer-defined stable identity string.
+      */
+     std::string stable_id;
++
++    /** @brief Haptics RTP destination "ip:port" chosen by the host application (e.g. the streaming client's address); empty = environment fallback. */
++    std::string haptics_destination;
+   };
+ 
+   /**
+diff --git a/src/platform/linux/uhid_backend.cpp b/src/platform/linux/uhid_backend.cpp
+index 2562d65..3c6afad 100644
+--- a/src/platform/linux/uhid_backend.cpp
++++ b/src/platform/linux/uhid_backend.cpp
+@@ -3664,6 +3664,13 @@ namespace lvh::detail {
+     constexpr auto dualsense_haptics_gain_file_env = "LIBVIRTUALHID_DUALSENSE_HAPTICS_GAIN_FILE";
+     /** @brief "4" sends the speaker channels 1-2 with the haptic channels 3-4 (default: haptics only). */
+     constexpr auto dualsense_rtp_channels_env = "LIBVIRTUALHID_DUALSENSE_RTP_CHANNELS";
++    /** @brief Text file of "key=value" haptics settings (gain, channels); unset = none. Overrides the channel and gain variables. */
++    constexpr auto dualsense_settings_env = "LIBVIRTUALHID_DUALSENSE_SETTINGS";
++    /** @brief JSON status file, rewritten about once per second while a USB/IP DualSense is attached; unset = none. */
++    constexpr auto dualsense_status_env = "LIBVIRTUALHID_DUALSENSE_STATUS";
++    constexpr auto usbip_status_interval = std::chrono::seconds {1};
++    /** @brief Peak level reported for a channel that stayed silent during the last second. */
++    constexpr float usbip_silence_db = -120.0F;
+     constexpr int usbip_attach_attempts = 3;
+     constexpr auto usbip_enumeration_timeout = std::chrono::seconds {2};
+     constexpr auto usbip_enumeration_poll_interval = std::chrono::milliseconds {10};
+@@ -3684,6 +3691,20 @@ namespace lvh::detail {
+       return value.has_value() && *value == expected;
+     }
+ 
++    /** @brief Escape the characters that cannot appear raw in a JSON string; control characters are dropped. */
++    std::string json_escape(std::string_view text) {
++      std::string escaped;
++      for (const auto c : text) {
++        if (c == '"' || c == '\\') {
++          escaped += '\\';
++          escaped += c;
++        } else if (static_cast<unsigned char>(c) >= 0x20) {
++          escaped += c;
++        }
++      }
++      return escaped;
++    }
++
+     std::optional<float> parse_float(const std::string &text) {
+       char *end = nullptr;
+       const auto value = std::strtof(text.c_str(), &end);
+@@ -3881,7 +3902,7 @@ namespace lvh::detail {
+ 
+         const auto mac = parse_mac_address(options.metadata.stable_id).value_or(generated_mac_address(id));
+         auto gamepad = std::make_unique<UsbipGamepad>(options.profile, mac);
+-        if (auto status = gamepad->start(sysfs_root); !status.ok()) {
++        if (auto status = gamepad->start(sysfs_root, options); !status.ok()) {
+           static_cast<void>(gamepad->close());
+           return {std::move(status), nullptr};
+         }
+@@ -3961,6 +3982,7 @@ namespace lvh::detail {
+         if (session_) {
+           session_->stop();
+         }
++        stop_status_writer();
+ 
+         std::size_t dropped = 0;
+         {
+@@ -3986,7 +4008,7 @@ namespace lvh::detail {
+        * @param sysfs_root vhci-hcd sysfs directory.
+        * @return Start status; on failure the caller closes the gamepad.
+        */
+-      OperationStatus start(std::string sysfs_root) {
++      OperationStatus start(std::string sysfs_root, const CreateGamepadOptions &options) {
+         sysfs_root_ = std::move(sysfs_root);
+ 
+         std::array<int, 2> pair {-1, -1};
+@@ -3995,10 +4017,11 @@ namespace lvh::detail {
+         }
+ 
+         device_ = std::make_unique<ds5usbip::DualSenseDevice>(make_device_config(), make_device_callbacks());
+-        configure_haptics();
++        configure_haptics(options);
+ 
+         ds5usbip::UsbipSession::Callbacks callbacks;
+         callbacks.audio_out = [this](std::span<const std::uint8_t> pcm) {
++          record_peaks(pcm);
+           if (haptics_) {
+             haptics_->send(pcm);
+           }
+@@ -4025,6 +4048,7 @@ namespace lvh::detail {
+         dispatcher_ = std::jthread {[this](std::stop_token stop_token) {
+           dispatch_loop(stop_token);
+         }};
++        start_status_writer();
+         return OperationStatus::success();
+       }
+ 
+@@ -4088,35 +4112,160 @@ namespace lvh::detail {
+       }
+ 
+       /**
+-       * @brief Create the RTP haptics sender when LIBVIRTUALHID_DUALSENSE_HAPTICS_RTP is set.
++       * @brief Resolve the haptics settings and create the RTP sender when a destination is known.
++       *
++       * The destination is options.metadata.haptics_destination, else LIBVIRTUALHID_DUALSENSE_HAPTICS_RTP.
++       * The settings file (LIBVIRTUALHID_DUALSENSE_SETTINGS) overrides the channel and gain variables.
++       * Without LIBVIRTUALHID_DUALSENSE_HAPTICS_GAIN_FILE, the settings file is the gain file.
++       *
++       * @param options Creation options carrying the host's haptics destination.
+        */
+-      void configure_haptics() {
+-        const auto destination = environment_string(dualsense_haptics_rtp_env);
+-        if (!destination) {
+-          return;
+-        }
++      void configure_haptics(const CreateGamepadOptions &options) {
++        const auto settings_path = environment_string(dualsense_settings_env).value_or(std::string {});
++        const auto settings = settings_path.empty() ? ds5usbip::HapticsSettings {} : ds5usbip::load_haptics_settings(settings_path);
+ 
+-        auto sender = std::make_unique<ds5usbip::HapticsRtpSender>(usbip_log);
+-        if (!sender->set_destination(*destination)) {
+-          usbip_log(std::format("haptics disabled, invalid destination {}", *destination));
+-          return;
++        haptics_channels_ = environment_string(dualsense_rtp_channels_env).value_or(std::string {}) == "4" ? 4U : 2U;
++        if (settings.channels) {
++          haptics_channels_ = *settings.channels;
+         }
+ 
+-        auto gain = 1.0F;
++        configured_gain_ = 1.0F;
+         if (const auto gain_text = environment_string(dualsense_haptics_gain_env)) {
+           if (const auto parsed = parse_float(*gain_text)) {
+-            gain = *parsed;
++            configured_gain_ = *parsed;
+           } else {
+             usbip_log(std::format("invalid haptics gain {}, using 1", *gain_text));
+           }
+         }
+-        sender->set_gain(gain, environment_string(dualsense_haptics_gain_file_env).value_or(std::string {}));
+-        if (const auto channels = environment_string(dualsense_rtp_channels_env); channels && *channels == "4") {
+-          sender->set_channels(4);
++        if (settings.gain) {
++          configured_gain_ = *settings.gain;
++        }
++
++        const auto destination = options.metadata.haptics_destination.empty() ?
++                                   environment_string(dualsense_haptics_rtp_env).value_or(std::string {}) :
++                                   options.metadata.haptics_destination;
++        if (destination.empty()) {
++          return;
++        }
++
++        auto sender = std::make_unique<ds5usbip::HapticsRtpSender>(usbip_log);
++        if (!sender->set_destination(destination)) {
++          usbip_log(std::format("haptics disabled, invalid destination {}", destination));
++          return;
+         }
++        sender->set_gain(configured_gain_, environment_string(dualsense_haptics_gain_file_env).value_or(settings_path));
++        sender->set_channels(haptics_channels_);
++        haptics_destination_ = destination;
+         haptics_ = std::move(sender);
+       }
+ 
++      /**
++       * @brief Track the peak level of each PCM channel over the current second, for the status file.
++       *
++       * Runs on the session audio thread: only lock-free atomics, no I/O. Levels are taken before the haptics gain.
++       *
++       * @param pcm One isochronous packet: S16_LE, four interleaved channels.
++       */
++      void record_peaks(std::span<const std::uint8_t> pcm) {
++        constexpr std::size_t frame_bytes = 8;
++        std::array<std::uint32_t, 4> peaks {};
++        for (std::size_t frame = 0; frame + frame_bytes <= pcm.size(); frame += frame_bytes) {
++          for (std::size_t channel = 0; channel < peaks.size(); ++channel) {
++            const auto sample = static_cast<std::int32_t>(static_cast<std::int16_t>(pcm[frame + 2 * channel] | (pcm[frame + 2 * channel + 1] << 8)));
++            peaks[channel] = std::max(peaks[channel], static_cast<std::uint32_t>(sample < 0 ? -sample : sample));
++          }
++        }
++        for (std::size_t channel = 0; channel < peaks.size(); ++channel) {
++          auto current = peak_levels_[channel].load(std::memory_order_relaxed);
++          while (peaks[channel] > current &&
++                 !peak_levels_[channel].compare_exchange_weak(current, peaks[channel], std::memory_order_relaxed)) {
++          }
++        }
++      }
++
++      /**
++       * @brief Start the status writer when LIBVIRTUALHID_DUALSENSE_STATUS is set.
++       *
++       * Called after enumeration, so the port, destination and channels are fixed before the thread starts.
++       */
++      void start_status_writer() {
++        const auto status_path = environment_string(dualsense_status_env).value_or(std::string {});
++        if (status_path.empty()) {
++          return;
++        }
++        status_path_ = status_path;
++        status_port_ = attached_port_.value_or(-1);
++        status_writer_ = std::jthread {[this](std::stop_token stop_token) {
++          status_loop(stop_token);
++        }};
++      }
++
++      /**
++       * @brief Write the status file now and then once per second until stop is requested.
++       *
++       * @param stop_token Stop request from close().
++       */
++      void status_loop(std::stop_token stop_token) {
++        write_status(true);
++        std::unique_lock lock {status_mutex_};
++        while (true) {
++          static_cast<void>(status_condition_.wait_for(lock, stop_token, usbip_status_interval, [&stop_token] {
++            return stop_token.stop_requested();
++          }));
++          if (stop_token.stop_requested()) {
++            return;
++          }
++          write_status(true);
++        }
++      }
++
++      /**
++       * @brief Stop the status writer and write the closing record, once.
++       */
++      void stop_status_writer() {
++        if (!status_writer_.joinable()) {
++          return;
++        }
++        status_writer_.request_stop();
++        status_writer_.join();
++        write_status(false);
++      }
++
++      /**
++       * @brief Write the status JSON atomically. Failures are ignored: the file is diagnostic only.
++       *
++       * Attached records consume the peak levels of the last second. With several gamepads, the last writer wins.
++       *
++       * @param attached true for the periodic record, false for the closing record.
++       */
++      void write_status(bool attached) {
++        const auto updated_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
++        std::string text;
++        if (attached) {
++          const auto gain = haptics_ ? haptics_->gain() : configured_gain_;
++          const auto packets = haptics_ ? haptics_->packets() : std::uint64_t {0};
++          std::string peaks;
++          for (std::size_t channel = 0; channel < peak_levels_.size(); ++channel) {
++            const auto peak = peak_levels_[channel].exchange(0, std::memory_order_relaxed);
++            const auto db = peak == 0 ? usbip_silence_db : 20.0F * std::log10(static_cast<float>(peak) / 32768.0F);
++            peaks += std::format("{}{:.1f}", channel == 0 ? "" : ",", db);
++          }
++          text = std::format(
++            R"({{"attached":true,"vhci_port":{},"destination":"{}","channels":{},"gain":{},"peak_db":[{}],"packets":{},"updated_ms":{}}})",
++            status_port_,
++            json_escape(haptics_destination_),
++            haptics_channels_,
++            gain,
++            peaks,
++            packets,
++            updated_ms
++          );
++        } else {
++          text = std::format(R"({{"attached":false,"updated_ms":{}}})", updated_ms);
++        }
++        static_cast<void>(ds5usbip::write_text_atomically(status_path_, text + "\n"));
++      }
++
+       ds5usbip::DeviceConfig make_device_config() {
+         ds5usbip::DeviceConfig config;
+         config.hid_report_descriptor = std::span<const std::uint8_t> {profile_.report_descriptor};
+@@ -4230,9 +4379,18 @@ namespace lvh::detail {
+       std::deque<std::vector<std::uint8_t>> output_queue_;
+       std::size_t dropped_output_reports_ = 0;
+       std::unique_ptr<ds5usbip::HapticsRtpSender> haptics_;
++      std::string haptics_destination_;
++      unsigned haptics_channels_ = 2;
++      float configured_gain_ = 1.0F;
++      std::array<std::atomic<std::uint32_t>, 4> peak_levels_ {};
++      std::string status_path_;
++      int status_port_ = -1;
++      std::mutex status_mutex_;
++      std::condition_variable_any status_condition_;
+       std::unique_ptr<ds5usbip::DualSenseDevice> device_;
+       std::unique_ptr<ds5usbip::UsbipSession> session_;
+       std::jthread dispatcher_;
++      std::jthread status_writer_;
+     };
+ #endif
+ 
+diff --git a/tests/fixtures/include/fixtures/linux_backend_test_hooks.hpp b/tests/fixtures/include/fixtures/linux_backend_test_hooks.hpp
+index 5356fe8..5c54f28 100644
+--- a/tests/fixtures/include/fixtures/linux_backend_test_hooks.hpp
++++ b/tests/fixtures/include/fixtures/linux_backend_test_hooks.hpp
+@@ -1174,6 +1174,34 @@ namespace lvh::detail::test {
+    */
+   LinuxUsbipRoundTripResult linux_usbip_gamepad_round_trip();
+ 
++  /**
++   * @brief Haptics destination, settings and environment for one UsbipGamepad status run. Empty strings mean unset.
++   */
++  struct LinuxUsbipStatusScenario {
++    std::string metadata_destination;  ///< CreateGamepadOptions::metadata.haptics_destination.
++    std::string env_destination;  ///< LIBVIRTUALHID_DUALSENSE_HAPTICS_RTP.
++    std::string env_channels;  ///< LIBVIRTUALHID_DUALSENSE_RTP_CHANNELS.
++    std::string env_gain;  ///< LIBVIRTUALHID_DUALSENSE_HAPTICS_GAIN.
++    std::optional<std::string> settings_text;  ///< Content of the settings file; nullopt leaves LIBVIRTUALHID_DUALSENSE_SETTINGS unset.
++  };
++
++  /**
++   * @brief Observable outcome of one UsbipGamepad status run.
++   */
++  struct LinuxUsbipStatusResult {
++    OperationStatus create_status;  ///< Status of create_gamepad.
++    std::string status_while_attached;  ///< Status file content once enumerated, before close().
++    std::string status_after_close;  ///< Status file content after close().
++  };
++
++  /**
++   * @brief Run the USB/IP DualSense happy path with a status file and haptics settings, then close it.
++   *
++   * @param scenario Destination, settings and environment to use.
++   * @return Observed status file contents.
++   */
++  LinuxUsbipStatusResult linux_usbip_gamepad_status(const LinuxUsbipStatusScenario &scenario);
++
+   /**
+    * @brief Exercise Bluetooth DualSense UHID framing and signed feature replies over a socketpair.
+    *
+diff --git a/tests/fixtures/linux_backend_test_hooks.cpp b/tests/fixtures/linux_backend_test_hooks.cpp
+index 75c923c..b777773 100644
+--- a/tests/fixtures/linux_backend_test_hooks.cpp
++++ b/tests/fixtures/linux_backend_test_hooks.cpp
+@@ -2493,6 +2493,149 @@ namespace lvh::detail::test {
+     return result;
+   }
+ 
++  namespace {
++
++    /**
++     * @brief Temporary directory for the settings and status files, removed with its owner.
++     */
++    class ScopedTemporaryDirectory {
++    public:
++      ScopedTemporaryDirectory():
++          root_ {std::filesystem::temp_directory_path() / std::format("lvh-status-{}-{}", ::getpid(), std::random_device {}())} {
++        std::filesystem::create_directories(root_);
++      }
++
++      ScopedTemporaryDirectory(const ScopedTemporaryDirectory &) = delete;
++      ScopedTemporaryDirectory &operator=(const ScopedTemporaryDirectory &) = delete;
++      ScopedTemporaryDirectory(ScopedTemporaryDirectory &&) noexcept = delete;
++      ScopedTemporaryDirectory &operator=(ScopedTemporaryDirectory &&) noexcept = delete;
++
++      ~ScopedTemporaryDirectory() {
++        std::error_code error;
++        std::filesystem::remove_all(root_, error);
++      }
++
++      const std::filesystem::path &path() const {
++        return root_;
++      }
++
++    private:
++      std::filesystem::path root_;
++    };
++
++    /**
++     * @brief Sets one environment variable for the scope; an empty value leaves it unset.
++     */
++    class ScopedEnvironmentVariable {
++    public:
++      ScopedEnvironmentVariable(const char *name, const std::string &value):
++          name_ {name} {
++        if (value.empty()) {
++          static_cast<void>(::unsetenv(name_));
++        } else {
++          static_cast<void>(::setenv(name_, value.c_str(), 1));
++        }
++      }
++
++      ScopedEnvironmentVariable(const ScopedEnvironmentVariable &) = delete;
++      ScopedEnvironmentVariable &operator=(const ScopedEnvironmentVariable &) = delete;
++      ScopedEnvironmentVariable(ScopedEnvironmentVariable &&) noexcept = delete;
++      ScopedEnvironmentVariable &operator=(ScopedEnvironmentVariable &&) noexcept = delete;
++
++      ~ScopedEnvironmentVariable() {
++        static_cast<void>(::unsetenv(name_));
++      }
++
++    private:
++      const char *name_;
++    };
++
++    std::string read_whole_file(const std::filesystem::path &path) {
++      std::ifstream input {path};
++      std::ostringstream text;
++      text << input.rdbuf();
++      return text.str();
++    }
++
++    /**
++     * @brief Poll the status file until it contains needle, for up to three seconds.
++     */
++    void wait_for_status_text(const std::filesystem::path &path, std::string_view needle) {
++      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds {3};
++      while (std::chrono::steady_clock::now() < deadline) {
++        if (read_whole_file(path).find(needle) != std::string::npos) {
++          return;
++        }
++        std::this_thread::sleep_for(std::chrono::milliseconds {5});
++      }
++    }
++
++  }  // namespace
++
++  LinuxUsbipStatusResult linux_usbip_gamepad_status(const LinuxUsbipStatusScenario &scenario) {
++    namespace wire = ds5usbip::usbip;
++    LinuxUsbipStatusResult result;
++    ScopedTemporaryDirectory directory;
++    const auto status_path = directory.path() / "status.json";
++    std::string settings_path;
++    if (scenario.settings_text) {
++      settings_path = (directory.path() / "settings.conf").string();
++      std::ofstream settings {settings_path};
++      settings << *scenario.settings_text;
++    }
++
++    ScopedVhciSysfs sysfs {std::string {usbip_status_header} + std::string {usbip_status_port0_busy} + "hs  0001 004 000 00000000 000000 0-0\n", true};
++    ScopedUsbipEnvironment environment {sysfs.path(), true};
++    ScopedEnvironmentVariable status_env {"LIBVIRTUALHID_DUALSENSE_STATUS", status_path.string()};
++    ScopedEnvironmentVariable settings_env {"LIBVIRTUALHID_DUALSENSE_SETTINGS", settings_path};
++    ScopedEnvironmentVariable destination_env {"LIBVIRTUALHID_DUALSENSE_HAPTICS_RTP", scenario.env_destination};
++    ScopedEnvironmentVariable channels_env {"LIBVIRTUALHID_DUALSENSE_RTP_CHANNELS", scenario.env_channels};
++    ScopedEnvironmentVariable gain_env {"LIBVIRTUALHID_DUALSENSE_HAPTICS_GAIN", scenario.env_gain};
++    ScopedEnvironmentVariable gain_file_env {"LIBVIRTUALHID_DUALSENSE_HAPTICS_GAIN_FILE", {}};
++
++    UsbipAttachProbe probe;
++    LinuxTestSyscalls syscalls;
++    install_usbip_hooks(syscalls, probe);
++    ScopedLinuxTestSyscalls scoped_syscalls {syscalls};
++
++    CreateGamepadOptions options;
++    options.profile = profiles::dualsense_usb();
++    options.metadata.stable_id = "02:03:04:05:06:07";
++    options.metadata.haptics_destination = scenario.metadata_destination;
++
++    BackendGamepadCreationResult created;
++    std::jthread creator {[&created, &options] {
++      LinuxUhidBackend backend;
++      created = backend.create_gamepad(1, options);
++    }};
++
++    if (!wait_for_attach(probe)) {
++      creator.join();
++      result.create_status = created.status;
++      return result;
++    }
++    int peer_fd = -1;
++    {
++      std::lock_guard lock {probe.mutex};
++      peer_fd = probe.peer_fd;
++    }
++    std::uint32_t seqnum = 0;
++    const auto configured = peer_transact(peer_fd, seqnum, wire::kDirOut, 0, {0x00, 0x09, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00}, {}, 0);
++    static_cast<void>(configured);
++    creator.join();
++    result.create_status = created.status;
++    if (!created) {
++      return result;
++    }
++
++    wait_for_status_text(status_path, "\"attached\":true");
++    result.status_while_attached = read_whole_file(status_path);
++    static_cast<void>(created.gamepad->close());
++    result.status_after_close = read_whole_file(status_path);
++    created.gamepad.reset();
++    return result;
++  }
++
+   LinuxUhidRoundTripResult linux_dualsense_uhid_socketpair_reports() {
+     LinuxUhidRoundTripResult result;
+     std::array<int, 2> descriptors {-1, -1};
+diff --git a/tests/unit/test_linux_backend.cpp b/tests/unit/test_linux_backend.cpp
+index 344a6d8..a186efa 100644
+--- a/tests/unit/test_linux_backend.cpp
++++ b/tests/unit/test_linux_backend.cpp
+@@ -1790,3 +1790,54 @@ TEST_F(LinuxBackendTest, UsbipDualSenseCloseDetachesAndEndsSession) {
+   EXPECT_TRUE(result.peer_saw_eof_after_close);
+   EXPECT_EQ(result.detach_text, "1");
+ }
++
++TEST_F(LinuxBackendTest, UsbipStatusFileReportsAttachedThenClosedDevice) {
++  const auto result = lvh::detail::test::linux_usbip_gamepad_status({});
++  EXPECT_TRUE(result.create_status.ok()) << result.create_status.message();
++  // Exact record, up to updated_ms: port 1 is the first free port of the fake vhci-hcd status.
++  constexpr std::string_view attached_prefix =
++    R"({"attached":true,"vhci_port":1,"destination":"","channels":2,"gain":1,"peak_db":[-120.0,-120.0,-120.0,-120.0],"packets":0,"updated_ms":)";
++  EXPECT_TRUE(result.status_while_attached.starts_with(attached_prefix)) << result.status_while_attached;
++  EXPECT_TRUE(result.status_while_attached.ends_with("}\n")) << result.status_while_attached;
++  EXPECT_TRUE(result.status_after_close.starts_with(R"({"attached":false,"updated_ms":)")) << result.status_after_close;
++  EXPECT_EQ(result.status_after_close.find("true"), std::string::npos) << result.status_after_close;
++}
++
++TEST_F(LinuxBackendTest, UsbipHapticsDestinationFromMetadataWinsOverEnvironment) {
++  lvh::detail::test::LinuxUsbipStatusScenario scenario;
++  scenario.metadata_destination = "127.0.0.1:46100";
++  scenario.env_destination = "127.0.0.1:46200";
++  const auto result = lvh::detail::test::linux_usbip_gamepad_status(scenario);
++  EXPECT_TRUE(result.create_status.ok()) << result.create_status.message();
++  EXPECT_NE(result.status_while_attached.find(R"("destination":"127.0.0.1:46100")"), std::string::npos) << result.status_while_attached;
++  EXPECT_EQ(result.status_while_attached.find("46200"), std::string::npos) << result.status_while_attached;
++}
++
++TEST_F(LinuxBackendTest, UsbipHapticsDestinationFallsBackToEnvironment) {
++  lvh::detail::test::LinuxUsbipStatusScenario scenario;
++  scenario.env_destination = "127.0.0.1:46200";
++  const auto result = lvh::detail::test::linux_usbip_gamepad_status(scenario);
++  EXPECT_TRUE(result.create_status.ok()) << result.create_status.message();
++  EXPECT_NE(result.status_while_attached.find(R"("destination":"127.0.0.1:46200")"), std::string::npos) << result.status_while_attached;
++}
++
++TEST_F(LinuxBackendTest, UsbipSettingsFileOverridesChannelsAndGain) {
++  lvh::detail::test::LinuxUsbipStatusScenario scenario;
++  scenario.metadata_destination = "127.0.0.1:46100";
++  scenario.env_channels = "2";
++  scenario.env_gain = "1";
++  scenario.settings_text = "# haptics\nchannels=4\ngain=2.5\n";
++  const auto result = lvh::detail::test::linux_usbip_gamepad_status(scenario);
++  EXPECT_TRUE(result.create_status.ok()) << result.create_status.message();
++  EXPECT_NE(result.status_while_attached.find(R"("channels":4,"gain":2.5)"), std::string::npos) << result.status_while_attached;
++}
++
++TEST_F(LinuxBackendTest, UsbipInvalidSettingsAreIgnored) {
++  lvh::detail::test::LinuxUsbipStatusScenario scenario;
++  scenario.metadata_destination = "127.0.0.1:46100";
++  scenario.env_gain = "1.5";
++  scenario.settings_text = "channels=3\ngain=99\n";
++  const auto result = lvh::detail::test::linux_usbip_gamepad_status(scenario);
++  EXPECT_TRUE(result.create_status.ok()) << result.create_status.message();
++  EXPECT_NE(result.status_while_attached.find(R"("channels":2,"gain":1.5)"), std::string::npos) << result.status_while_attached;
++}
+-- 
+2.43.0
+

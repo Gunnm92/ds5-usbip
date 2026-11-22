@@ -26,6 +26,8 @@ pour le Sunshine de sunshine-ds ; le récepteur doit suivre), marquage DSCP EF (
 n'a pas encore été testé seul : il reste à vérifier qu'aucun routeur ne le
 pénalise.
 
+**Fichier de réglages et état (backend libvirtualhid, `LIBVIRTUALHID_DUALSENSE_*`)** : `LIBVIRTUALHID_DUALSENSE_SETTINGS=<fichier>` lit des lignes `gain=<float>` (0 < g ≤ 64) et `channels=2|4` ; elles remplacent `…_HAPTICS_GAIN` et `…_RTP_CHANNELS`, et le gain est relu chaque seconde (à chaud). La destination RTP peut venir de l'application hôte (`haptics_destination`), à défaut de `LIBVIRTUALHID_DUALSENSE_HAPTICS_RTP`. `LIBVIRTUALHID_DUALSENSE_STATUS=<fichier>` reçoit chaque seconde un JSON (`attached`, `vhci_port`, `destination`, `channels`, `gain`, `peak_db` par canal, `packets`, `updated_ms`) ; détails dans `libvirtualhid/FACTS.md`, section 9.
+
 **À afficher** : chaque seconde, le serveur journalise le pic et le niveau
 RMS des 4 canaux (`audio: 48000 trames | HP G … | haptique G … (N non nuls)`) ;
 état de la session (`périphérique importé`, `session terminée`) ; état de

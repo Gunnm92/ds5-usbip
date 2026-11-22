@@ -7,14 +7,56 @@
 
 #include <netinet/in.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 
 #include "log.hpp"
 
 namespace ds5usbip {
+
+  /**
+   * @brief Haptics settings read from a "key=value" text file (see load_haptics_settings).
+   */
+  struct HapticsSettings {
+    /** @brief Gain from the "gain=" key, in the range 0 < g <= 64. */
+    std::optional<float> gain;
+    /** @brief Channel count from the "channels=" key: 2 or 4. */
+    std::optional<unsigned> channels;
+  };
+
+  /**
+   * @brief Parses settings text: one "key=value" per line, "#" starts a comment, blank lines are ignored.
+   *
+   * Unknown keys and out-of-range values are ignored. A later valid line replaces an earlier one.
+   * @param text File content.
+   * @return The valid settings found in text.
+   */
+  HapticsSettings parse_haptics_settings(std::string_view text);
+
+  /**
+   * @brief Reads and parses a settings file. A missing or unreadable file gives empty settings.
+   * @param path Settings file path.
+   * @return The valid settings found in the file.
+   */
+  HapticsSettings load_haptics_settings(const std::string &path);
+
+  /**
+   * @brief Parses a gain value: a plain number ("2.5") or a "gain=<float>" line among other lines.
+   * @param text Gain file content.
+   * @return The gain when a valid one (0 < g <= 64) is found, otherwise nullopt.
+   */
+  std::optional<float> parse_gain_text(std::string_view text);
+
+  /**
+   * @brief Writes text to "<path>.tmp" and renames it over path, so readers never see a partial file.
+   * @return false on any I/O error (the target file is then left unchanged).
+   */
+  bool write_text_atomically(const std::string &path, std::string_view text);
 
   /** @brief RTP sender for the haptic channels 2-3 of the 4-channel audio output. */
   class HapticsRtpSender {
@@ -56,9 +98,14 @@ namespace ds5usbip {
      */
     void send(std::span<const std::uint8_t> pcm4ch);
 
-    /** @brief Number of RTP packets sent so far. */
+    /** @brief Number of RTP packets sent so far. Safe to call from any thread. */
     std::uint64_t packets() const {
-      return packets_;
+      return packets_.load(std::memory_order_relaxed);
+    }
+
+    /** @brief Current gain (after any reload from the gain file). Safe to call from any thread. */
+    float gain() const {
+      return gain_.load(std::memory_order_relaxed);
     }
 
   private:
@@ -68,8 +115,8 @@ namespace ds5usbip {
     std::uint16_t seq_ = 0;
     std::uint32_t timestamp_ = 0;
     std::uint32_t ssrc_ = 0;
-    std::uint64_t packets_ = 0;
-    float gain_ = 1.0f;
+    std::atomic<std::uint64_t> packets_ {0};
+    std::atomic<float> gain_ {1.0f};
     unsigned channels_ = 2;
     std::string gain_file_;
     std::chrono::steady_clock::time_point last_gain_check_ {};

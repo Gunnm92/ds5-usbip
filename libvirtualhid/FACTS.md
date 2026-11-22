@@ -68,8 +68,30 @@ Selection and fallback:
 Environment variables:
 - `LIBVIRTUALHID_DUALSENSE_USBIP=1`: enables the backend.
 - `LIBVIRTUALHID_VHCI_SYSFS`: vhci-hcd sysfs directory (default `/sys/devices/platform/vhci_hcd.0`). Needs `status`, `attach`, `detach`.
-- `LIBVIRTUALHID_DUALSENSE_HAPTICS_RTP=IP:PORT`: sends haptic channels 3-4 as RTP (library `HapticsRtpSender`). An invalid destination disables haptics with a stderr line.
+- `LIBVIRTUALHID_DUALSENSE_HAPTICS_RTP=IP:PORT`: sends haptic channels 3-4 as RTP (library `HapticsRtpSender`). An invalid destination disables haptics with a stderr line. Used only when `GamepadMetadata::haptics_destination` is empty (see below).
 - `LIBVIRTUALHID_DUALSENSE_HAPTICS_GAIN=<float>` (default 1) and `LIBVIRTUALHID_DUALSENSE_HAPTICS_GAIN_FILE=<path>` (re-read every second by the library).
+- `LIBVIRTUALHID_DUALSENSE_RTP_CHANNELS=4`: sends 4 channels (speakers 1-2 + haptics 3-4) instead of haptics only.
+- `LIBVIRTUALHID_DUALSENSE_SETTINGS=<path>` (unset = none): settings file, see below.
+- `LIBVIRTUALHID_DUALSENSE_STATUS=<path>` (unset = none): status file, see below.
+
+Haptics destination (patch 0003): `CreateGamepadOptions::metadata.haptics_destination` (`GamepadMetadata::haptics_destination`, set by the host application, e.g. the streaming client's address) wins when non-empty. Otherwise `LIBVIRTUALHID_DUALSENSE_HAPTICS_RTP` is used. Otherwise no RTP is sent.
+
+Settings file (`LIBVIRTUALHID_DUALSENSE_SETTINGS`): text, one `key=value` per line, `#` starts a comment.
+- `gain`: float, `0 < g <= 64`. Read at pad creation and overrides `LIBVIRTUALHID_DUALSENSE_HAPTICS_GAIN`.
+- `channels`: `2` or `4`. Read at pad creation and overrides `LIBVIRTUALHID_DUALSENSE_RTP_CHANNELS`.
+- Unknown keys and invalid values are ignored; a missing or unreadable file is ignored silently.
+- Without `LIBVIRTUALHID_DUALSENSE_HAPTICS_GAIN_FILE`, the settings file is the gain file: it is re-read every second while the pad lives, so a `gain=<float>` line changes the gain on the fly. The gain file also accepts a plain number (the older format).
+- Parsing and the gain reload are in the library: `ds5usbip::parse_haptics_settings`, `load_haptics_settings`, `parse_gain_text` (`src/usbip/haptics_rtp.hpp`).
+
+Status file (`LIBVIRTUALHID_DUALSENSE_STATUS`): while a USB/IP DualSense is attached, rewritten about once per second (first write right after enumeration) through `<path>.tmp` and a rename. One JSON object, one line:
+
+```
+{"attached":true,"vhci_port":1,"destination":"127.0.0.1:46100","channels":4,"gain":2.5,"peak_db":[-12.3,-40.1,-9.8,-7.2],"packets":1234,"updated_ms":1768000000000}
+```
+
+- `vhci_port`: port named in the attach line. `destination`: the RTP destination in use, empty when none. `channels`: 2 or 4. `gain`: current haptics gain (after any reload). `peak_db`: per channel 1-4, peak over the last second in dBFS, `-120.0` for silence. Peaks are taken from the PCM given to the audio callback, before gain. `packets`: RTP packets sent. `updated_ms`: Unix epoch in milliseconds.
+- On `close()`, one closing record is written: `{"attached":false,"updated_ms":...}`. Write errors are ignored.
+- The status writer is a dedicated thread (not the session threads or the dispatcher). Only one pad at a time is expected: with several pads, the last writer wins.
 
 Attach and teardown:
 - Socketpair: `pair[0]` goes to `UsbipSession`, `pair[1]` is written as `port fd 0x10001 3` to `attach`, then closed (vhci-hcd keeps its own reference). Ports come from `status` (first free `hs` port, skipping busy ones).
@@ -91,3 +113,4 @@ Known limitations:
 - The dispatcher-thread check asserts only that the callback is not on the caller thread. Library session threads are private, so their IDs cannot be compared.
 - Library defect: `UsbipSession` (`src/usbip/usbip_session.cpp`) reads `hid_in_count_` in `reader_loop` (for the final log) while `timer_loop` increments it without synchronisation. This is a data race; see the TSan notes in the report.
 - Library difference: GET_REPORT(feature) with an unknown id returns a zero report, while uhid returns EINVAL.
+- Status file and settings: covered by fixture tests (fake sysfs, socketpair, temp dir) that check the exact record layout and the destination, channels and gain fields. The `peak_db` values are not checked by an automated test (the fixture does not drive the isochronous audio path), and the gain hot reload is tested only in the library (`tests/cpp/session_test.cpp`).

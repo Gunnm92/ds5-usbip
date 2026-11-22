@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "usbip/dualsense_device.hpp"
+#include "usbip/haptics_rtp.hpp"
 #include "usbip/usbip_protocol.hpp"
 #include "usbip/usbip_session.hpp"
 #include "usbip/vhci.hpp"
@@ -421,6 +422,59 @@ namespace {
     check(vhci::attach_line(1, 7, 65537, 3) == "1 7 65537 3", "attach_line: \"1 7 65537 3\"");
   }
 
+  void test_gain_file_reload() {
+    const std::string path = "/tmp/ds5-gain-reload-test-" + std::to_string(::getpid());
+    check(write_text_atomically(path, "channels=4\ngain=1.5\n"), "gain reload: settings-style file written");
+    HapticsRtpSender sender;
+    check(sender.set_destination("127.0.0.1:46199"), "gain reload: destination accepted");
+    sender.set_gain(1.0F, path);
+    check(sender.gain() == 1.5F, "gain reload: gain= line read by set_gain");
+
+    check(write_text_atomically(path, "3\n"), "gain reload: plain number written");
+    const Bytes pcm(384, 0);
+    sender.send(pcm);  // the first send reloads the file: the last check is the epoch
+    check(sender.gain() == 3.0F, "gain reload: plain number read on send");
+    check(sender.packets() == 1, "gain reload: one RTP packet counted");
+
+    check(write_text_atomically(path, "gain=2\n"), "gain reload: gain= line written");
+    sender.send(pcm);  // within the same second: no reload yet
+    check(sender.gain() == 3.0F, "gain reload: no reload before one second");
+    static_cast<void>(std::remove(path.c_str()));
+  }
+
+  void test_haptics_settings() {
+    const auto both = parse_haptics_settings("# DS5 haptics\n gain = 2.5 \nchannels=4 # speakers too\n");
+    check(both.gain && *both.gain == 2.5F, "settings: gain=2.5 with spaces and a trailing comment");
+    check(both.channels && *both.channels == 4U, "settings: channels=4");
+
+    const auto two = parse_haptics_settings("channels=2\r\ngain=64\r\n");
+    check(two.channels && *two.channels == 2U, "settings: channels=2 with CRLF");
+    check(two.gain && *two.gain == 64.0F, "settings: gain=64 is the upper bound");
+
+    check(!parse_haptics_settings("gain=0\n").gain, "settings: gain=0 ignored");
+    check(!parse_haptics_settings("gain=65\n").gain, "settings: gain=65 ignored");
+    check(!parse_haptics_settings("gain=2.5x\n").gain, "settings: gain with trailing text ignored");
+    check(!parse_haptics_settings("channels=3\n").channels, "settings: channels=3 ignored");
+    check(!parse_haptics_settings("# gain=3\nflavour=sweet\njust text\n").gain, "settings: comments and unknown keys ignored");
+    const auto later = parse_haptics_settings("gain=2\ngain=bad\n");
+    check(later.gain && *later.gain == 2.0F, "settings: an invalid later line keeps the earlier value");
+
+    check(parse_gain_text("2.5\n") && *parse_gain_text("2.5\n") == 2.5F, "gain text: plain number");
+    check(parse_gain_text("gain=3\n") && *parse_gain_text("gain=3\n") == 3.0F, "gain text: gain= line");
+    check(parse_gain_text("channels=4\ngain=0.5\n") && *parse_gain_text("channels=4\ngain=0.5\n") == 0.5F, "gain text: gain= among other lines");
+    check(!parse_gain_text("-1\n"), "gain text: negative rejected");
+    check(!parse_gain_text("abc\n"), "gain text: text rejected");
+    check(!parse_gain_text(""), "gain text: empty rejected");
+
+    const std::string path = "/tmp/ds5-haptics-settings-test-" + std::to_string(::getpid());
+    check(write_text_atomically(path, "gain=1.5\nchannels=4\n"), "atomic write: succeeds");
+    const auto loaded = load_haptics_settings(path);
+    check(loaded.gain && *loaded.gain == 1.5F && loaded.channels && *loaded.channels == 4U, "load_haptics_settings: reads the file");
+    check(!write_text_atomically("/nonexistent-dir/x", "x"), "atomic write: fails on a missing directory");
+    static_cast<void>(std::remove(path.c_str()));
+    check(!load_haptics_settings(path).gain, "load_haptics_settings: missing file gives empty settings");
+  }
+
 }  // namespace
 
 int main() {
@@ -433,6 +487,8 @@ int main() {
   test_stop_latency();
   test_closed_on_peer_close();
   test_vhci();
+  test_haptics_settings();
+  test_gain_file_reload();
   std::printf("\n%d echec(s)\n", g_failures);
   return g_failures ? 1 : 0;
 }
