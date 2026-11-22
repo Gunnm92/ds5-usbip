@@ -570,12 +570,17 @@ bind RTSP server to port 48010 ». Un seul des deux à la fois.
    (sans vhci-hcd, le montage manque et SteamBox ne démarre pas).
 4. AIBox : intégration faite dans son projet (22/11), d'après
    `docs/aibox.md`.
-5. Grésillements à pleine échelle (actionneurs ou conversion 8 bits du
-   dongle) : gain d'émission (`LIBVIRTUALHID_DUALSENSE_HAPTICS_GAIN`) ou
-   filtre du dongle, au ressenti.
-6. Destination RTP automatique (adresse du client Moonlight connue de
-   Sunshine) au lieu de la variable fixe ; app compagnon
-   (`docs/parametres.md`) ; latence.
+5. Grésillements à pleine échelle : plus constatés (23/11, ressenti de
+   l'utilisateur) ; rien à faire.
+6. Destination RTP automatique : faite (correctif sunshine-ds 0001, page
+   « DualSense », validée le 23/11). sunshine-ds poussé (main f63eb4e,
+   release 20261122-2309).
+7. Latence : ~50 ms (40 ms de tampon client + réseau). Mesurer le délai de
+   la sortie du dongle sur AIBox, puis descendre `sess.latency.msec` au
+   minimum qui joue encore (10 ms = silence le 22/11).
+8. Page « DualSense » de Sunshine : la rendre plus attrayante (mise en
+   page, état en direct de la manette, retour visuel des réglages).
+9. App compagnon (`docs/parametres.md`).
 
 ### Phase 3 — mise en production
 
