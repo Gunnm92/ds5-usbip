@@ -514,7 +514,15 @@ en Docker (175/175 hors 21 tests exigeant /dev/uhid).
 Release publiée (22/11, 19 h 30) : sunshine-ds-v2026.1122.155624-20261122-1831
 (Sunshine v2026.1122.155624, libvirtualhid dd8153d + correctifs 0001/0002,
 ds5-usbip bc196b7) ; 186/186 tests, backend USB/IP vérifié dans le binaire.
-Reste : étape E (SteamBox, commits locaux) et tests en direct.
+**Phase 2 validée en direct (22/11, 20 h 30)** : SteamBox avec le Sunshine de
+sunshine-ds ; à la connexion Moonlight, Sunshine crée seul la DualSense USB/IP
+(port vhci occupé par sa socket, une seule DualSense, parent USB, carte son),
+oneshot s6 : `attach` au groupe input. F1 25 : vraies vibrations haptiques,
+nettement mieux que le prototype. Prochaine évolution : transmettre aussi les
+canaux 1-2 (haut-parleur de la manette) en RTP 4 canaux ; bruits parasites à
+éclaircir (piste : « Speaker Effect Leak » du dongle). AIBox non persistant :
+récepteur RTP, volume du dongle et arrêt du loopback perdus au redémarrage
+(projet AIBox).
 
 Étapes : 1. backend `UsbipGamepad` (copie de libvirtualhid, testé seul
 dans SteamBox) ; 2. compilation et release dans sunshine-ds ; 3.
