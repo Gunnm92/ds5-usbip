@@ -551,6 +551,14 @@ Côté Sunshine : correctifs de l'agent dans sunshine-ds (commits locaux,
 patches/sunshine/) à relire, puis `make build REQUIRE_USBIP=1`, release,
 `make push` SteamBox, test de la page sur http://<SteamBox>:47990.
 
+**23/11, 00 h 30 : page « DualSense » validée en direct.** Image SteamBox
+reconstruite (Sunshine 745f95a, correctifs sunshine-ds 0001-0002 sur la
+branche locale `dualsense-web`, f63eb4e), déployée et testée par
+l'utilisateur : tout fonctionne. Attention : ArcadeBox et SteamBox sont en
+réseau hôte et partagent les ports Sunshine (47984-48010), noVNC (6080) et
+le socket X ; ArcadeBox lancé, le Sunshine de SteamBox boucle sur « Couldn't
+bind RTSP server to port 48010 ». Un seul des deux à la fois.
+
 **Reste à faire :**
 1. SteamBox : commits poussés (22/11).
 2. Registre : réglé le 22/11 (`--insecure-registry=10.1.1.1:5003` dans
