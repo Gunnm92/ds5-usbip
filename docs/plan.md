@@ -490,6 +490,26 @@ le noyau). Contraintes :
   `snd-usb-audio` dans le fichier `go` d'Unraid, avant Docker (phase 3,
   par l'utilisateur).
 
+#### Répartition entre projets (décidé le 22/11)
+
+- **ds5-usbip** (ce dépôt) : source du backend USB/IP (modèle DualSense,
+  session USB/IP, haptiques RTP) et du correctif pour libvirtualhid.
+- **[sunshine-ds](https://github.com/Gunnm92/sunshine-ds)** (public, GPL de
+  Sunshine oblige) : compile libvirtualhid modifié + Sunshine, publie en
+  release une archive à décompresser : binaire, règle WirePlumber
+  `52-ds5-usbip.conf` (déplacée depuis SteamBox), script d'ouverture de
+  `attach`/`detach`.
+- **SteamBox** : seulement le générique — `prebuilt-fetch` de la release à
+  la place de l'étape `sunshine-usb`, règles udev ALSA/hidraw, cgroup
+  `116`, montage de `vhci_hcd.0` (modèle Unraid et doc). Le commit local
+  de la règle WirePlumber (f958479) sera annulé quand la release la
+  fournira.
+
+Étapes : 1. backend `UsbipGamepad` (copie de libvirtualhid, testé seul
+dans SteamBox) ; 2. compilation et release dans sunshine-ds ; 3.
+récupération par SteamBox (commits locaux) ; 4. test en vrai (Moonlight,
+F1 25, RIDE 6).
+
 ### Phase 3 — mise en production
 
 - Service s6 dans SteamBox (démarrage avec une session Moonlight, arrêt à la
