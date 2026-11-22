@@ -553,7 +553,7 @@ rien au haut-parleur de la manette (mesuré : canaux 1-2 nuls) ; le
    (Nginx Proxy Manager écoute en 18443, le 443 d'Unraid sert `nas.local`).
 3. Fichier `go` d'Unraid : `modprobe vhci-hcd snd-usb-audio` avant Docker
    (sans vhci-hcd, le montage manque et SteamBox ne démarre pas).
-4. AIBox (projet AIBox, voir plus haut) : récepteur RTP 4 canaux, volume
+4. AIBox (projet AIBox, guide : `docs/aibox.md`) : récepteur RTP 4 canaux, volume
    du dongle à 100 %, loopback désactivé, persistance, et verrouillage du
    récepteur sur le dongle (dont-reconnect / dont-fallback cassent la
    liaison).
