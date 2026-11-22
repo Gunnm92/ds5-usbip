@@ -44,6 +44,13 @@ namespace ds5usbip {
     void set_gain(float gain, std::string gain_file = {});
 
     /**
+     * @brief Choose how many channels are sent: 2 (haptics only, channels 3-4,
+     *        default) or 4 (speaker channels 1-2 unchanged + haptics 3-4).
+     *        The gain applies to the haptic channels only.
+     */
+    void set_channels(unsigned channels);
+
+    /**
      * @brief Sends one isochronous output packet (S16_LE, 4 interleaved channels);
      * only channels 2 and 3 are sent. Non-blocking: packets are dropped on error.
      */
@@ -63,6 +70,7 @@ namespace ds5usbip {
     std::uint32_t ssrc_ = 0;
     std::uint64_t packets_ = 0;
     float gain_ = 1.0f;
+    unsigned channels_ = 2;
     std::string gain_file_;
     std::chrono::steady_clock::time_point last_gain_check_ {};
 

@@ -44,6 +44,7 @@ namespace {
       "  -t, --haptics-to IP:PORT\n"
       "                      envoie les canaux haptiques 3-4 en RTP (L16 stéréo, PT 127)\n"
       "  -g, --haptics-gain G gain des haptiques (défaut 1)\n"
+      "      --rtp-channels N  2 = haptiques seules (défaut), 4 = haut-parleur + haptiques\n"
       "      --haptics-gain-file FICHIER\n"
       "                      gain relu chaque seconde dans ce fichier\n"
       "  -v, --verbose       journalise les requêtes de contrôle et les UNLINK\n"
@@ -69,10 +70,12 @@ int main(int argc, char **argv) {
     {"haptics-to", required_argument, nullptr, 't'},
     {"haptics-gain", required_argument, nullptr, 'g'},
     {"haptics-gain-file", required_argument, nullptr, 'G'},
+    {"rtp-channels", required_argument, nullptr, 'C'},
     {"verbose", no_argument, nullptr, 'v'},
     {"help", no_argument, nullptr, 'h'},
     {nullptr, 0, nullptr, 0},
   };
+  unsigned rtp_channels = 2;
   int c;
   while ((c = getopt_long(argc, argv, "d:t:g:vh", long_options, nullptr)) != -1) {
     switch (c) {
@@ -87,6 +90,9 @@ int main(int argc, char **argv) {
         break;
       case 'g':
         haptics_gain = std::strtof(optarg, nullptr);
+        break;
+      case 'C':
+        rtp_channels = static_cast<unsigned>(std::atoi(optarg));
         break;
       case 'G':
         haptics_gain_file = optarg;
@@ -122,6 +128,7 @@ int main(int argc, char **argv) {
       return 1;
     }
     haptics.set_gain(haptics_gain, haptics_gain_file);
+    haptics.set_channels(rtp_channels);
   }
 
   DualSenseDevice device(

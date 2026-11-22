@@ -1,4 +1,4 @@
-From f30a32f6717f1a4b152e82376dfa6cc9ba7235f4 Mon Sep 17 00:00:00 2001
+From 3000a88db2d4c4fd86228c35d78176da5bed4fc6 Mon Sep 17 00:00:00 2001
 From: Gunnm92 <gunnm44@gmail.com>
 Date: Sun, 22 Nov 2026 19:18:11 +0100
 Subject: [PATCH] feat(linux): DualSense USB/IP backend via vhci-hcd
@@ -20,11 +20,11 @@ output burst, the pairing feature report and close.
 Co-Authored-By: Claude Haiku 5.5 <noreply@anthropic.com>
 ---
  src/CMakeLists.txt                            |   8 +
- src/platform/linux/uhid_backend.cpp           | 599 ++++++++++++++++++
+ src/platform/linux/uhid_backend.cpp           | 604 ++++++++++++++++++
  .../fixtures/linux_backend_test_hooks.hpp     |  60 ++
- tests/fixtures/linux_backend_test_hooks.cpp   | 460 ++++++++++++++
+ tests/fixtures/linux_backend_test_hooks.cpp   | 460 +++++++++++++
  tests/unit/test_linux_backend.cpp             | 152 +++++
- 5 files changed, 1279 insertions(+)
+ 5 files changed, 1284 insertions(+)
 
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
 index d03952b..11d2a22 100644
@@ -46,7 +46,7 @@ index d03952b..11d2a22 100644
            PUBLIC
            Threads::Threads
 diff --git a/src/platform/linux/uhid_backend.cpp b/src/platform/linux/uhid_backend.cpp
-index f72d0de..6cf6e6f 100644
+index f72d0de..2562d65 100644
 --- a/src/platform/linux/uhid_backend.cpp
 +++ b/src/platform/linux/uhid_backend.cpp
 @@ -13,7 +13,10 @@
@@ -72,7 +72,7 @@ index f72d0de..6cf6e6f 100644
  #endif
  
  #include <libvirtualhid/profiles.hpp>
-@@ -3648,6 +3656,581 @@ namespace lvh::detail {
+@@ -3648,6 +3656,586 @@ namespace lvh::detail {
      };
  #endif
  
@@ -82,6 +82,8 @@ index f72d0de..6cf6e6f 100644
 +    constexpr auto dualsense_haptics_rtp_env = "LIBVIRTUALHID_DUALSENSE_HAPTICS_RTP";
 +    constexpr auto dualsense_haptics_gain_env = "LIBVIRTUALHID_DUALSENSE_HAPTICS_GAIN";
 +    constexpr auto dualsense_haptics_gain_file_env = "LIBVIRTUALHID_DUALSENSE_HAPTICS_GAIN_FILE";
++    /** @brief "4" sends the speaker channels 1-2 with the haptic channels 3-4 (default: haptics only). */
++    constexpr auto dualsense_rtp_channels_env = "LIBVIRTUALHID_DUALSENSE_RTP_CHANNELS";
 +    constexpr int usbip_attach_attempts = 3;
 +    constexpr auto usbip_enumeration_timeout = std::chrono::seconds {2};
 +    constexpr auto usbip_enumeration_poll_interval = std::chrono::milliseconds {10};
@@ -529,6 +531,9 @@ index f72d0de..6cf6e6f 100644
 +          }
 +        }
 +        sender->set_gain(gain, environment_string(dualsense_haptics_gain_file_env).value_or(std::string {}));
++        if (const auto channels = environment_string(dualsense_rtp_channels_env); channels && *channels == "4") {
++          sender->set_channels(4);
++        }
 +        haptics_ = std::move(sender);
 +      }
 +
@@ -654,7 +659,7 @@ index f72d0de..6cf6e6f 100644
      std::optional<DeviceProfile> effective_uinput_profile(const DeviceProfile &requested_profile) {
        auto effective_profile = requested_profile;
  #if defined(__FreeBSD__)
-@@ -3701,6 +4284,22 @@ namespace lvh::detail {
+@@ -3701,6 +4289,22 @@ namespace lvh::detail {
  
        BackendGamepadCreationResult create_gamepad(DeviceId id, const CreateGamepadOptions &options) override {
  #if defined(__linux__)

@@ -104,6 +104,10 @@ namespace ds5usbip {
     return static_cast<std::int16_t>(std::lrint(std::clamp(x, -1.0f, 32767.0f / 32768.0f) * 32768.0f));
   }
 
+  void HapticsRtpSender::set_channels(unsigned channels) {
+    channels_ = channels == 4 ? 4 : 2;
+  }
+
   void HapticsRtpSender::send(std::span<const std::uint8_t> pcm4ch) {
     if (fd_ < 0) {
       return;
@@ -113,7 +117,8 @@ namespace ds5usbip {
     if (!frames) {
       return;
     }
-    std::vector<std::uint8_t> pkt(12 + frames * 4);
+    const std::size_t out_frame = channels_ * 2;
+    std::vector<std::uint8_t> pkt(12 + frames * out_frame);
     pkt[0] = 0x80;  // version 2
     pkt[1] = kPayloadType;
     pkt[2] = static_cast<std::uint8_t>(seq_ >> 8);
@@ -127,14 +132,20 @@ namespace ds5usbip {
       last_gain_check_ = now;
       reload_gain();
     }
-    // Channels 2-3, S16_LE -> gain -> S16_BE.
+    // S16_LE -> S16_BE. 2 channels: haptics (input channels 2-3) with gain.
+    // 4 channels: speaker (0-1) unchanged, then haptics (2-3) with gain.
+    const unsigned first = channels_ == 4 ? 0 : 2;
     for (std::size_t f = 0; f < frames; ++f) {
-      const std::uint8_t *in = pcm4ch.data() + f * kInFrame + 4;
-      std::uint8_t *out = pkt.data() + 12 + f * 4;
-      for (int c = 0; c < 2; ++c) {
-        const auto v = static_cast<std::uint16_t>(shape(static_cast<std::int16_t>(in[2 * c] | (in[2 * c + 1] << 8)), gain_));
-        out[2 * c] = static_cast<std::uint8_t>(v >> 8);
-        out[2 * c + 1] = static_cast<std::uint8_t>(v);
+      const std::uint8_t *in = pcm4ch.data() + f * kInFrame;
+      std::uint8_t *out = pkt.data() + 12 + f * out_frame;
+      for (unsigned c = first, o = 0; c < 4; ++c, ++o) {
+        auto s = static_cast<std::int16_t>(in[2 * c] | (in[2 * c + 1] << 8));
+        if (c >= 2) {
+          s = shape(s, gain_);
+        }
+        const auto v = static_cast<std::uint16_t>(s);
+        out[2 * o] = static_cast<std::uint8_t>(v >> 8);
+        out[2 * o + 1] = static_cast<std::uint8_t>(v);
       }
     }
     ::sendto(fd_, pkt.data(), pkt.size(), MSG_DONTWAIT, reinterpret_cast<const sockaddr *>(&dest_), sizeof(dest_));

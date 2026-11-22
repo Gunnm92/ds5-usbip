@@ -19,8 +19,10 @@ jeu (Wine) ─► sortie DualSense ─► ds5-usbip ─RTP─► module-rtp-sour
 | Enregistrement PCM | `/tmp/ds5-audio.raw` | fichier S16_LE 4 canaux 48 kHz | `-d FICHIER` | non |
 | Écoute USB/IP | `127.0.0.1:3240` | adresse, port | `-a`, `-p` | non |
 
-Format RTP fixe : L16 stéréo big-endian, 48 kHz, type de charge 127, 1 ms
-(48 trames) par paquet, marquage DSCP EF (`IP_TOS 0xb8`). Le marquage
+Format RTP : L16 big-endian, 48 kHz, type de charge 127, 1 ms (48 trames)
+par paquet ; 2 canaux (haptiques 3-4, défaut) ou 4 canaux (haut-parleur 1-2 +
+haptiques 3-4 : `--rtp-channels 4`, ou `LIBVIRTUALHID_DUALSENSE_RTP_CHANNELS=4`
+pour le Sunshine de sunshine-ds ; le récepteur doit suivre), marquage DSCP EF (`IP_TOS 0xb8`). Le marquage
 n'a pas encore été testé seul : il reste à vérifier qu'aucun routeur ne le
 pénalise.
 
