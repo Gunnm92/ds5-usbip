@@ -435,6 +435,49 @@ chaque version de Sunshine (à proposer à LizardByte une fois stable).
 adaptatives, LED et vibration classique toujours fonctionnelles, haptiques
 HD en plus.
 
+#### Étude de la phase 2 (22/11, soir)
+
+**Point d'intégration.** libvirtualhid : `LinuxUhidBackend::create_gamepad()`
+(`src/platform/linux/uhid_backend.cpp`). Pour le profil `dualsense_usb`,
+essayer d'abord une nouvelle `UsbipGamepad`, repli sur `UhidGamepad` si
+vhci-hcd est indisponible. L'interface `BackendGamepad` colle au modèle
+du prototype :
+- `submit(state, report)` → `DualSenseDevice::set_input_report(report)` ;
+- rapports de sortie (interruption OUT, SET_REPORT) →
+  `reports::parse_output_reports(profile, report)` → `OutputCallback`,
+  comme `UhidGamepad::dispatch_output_report` (plus de miroir ni de leurre) ;
+- rapports feature : tables `playstation_feature_reports`, MAC tirée de
+  `metadata.stable_id` comme le backend uhid ;
+- `close()` : fermer la socket ; vhci-hcd débranche alors la manette.
+
+**Sans TCP.** vhci-hcd n'exige qu'une socket `SOCK_STREAM` : une
+`socketpair(AF_UNIX)` suffit. Une extrémité est donnée au noyau par
+`/sys/devices/platform/vhci_hcd.0/attach` (« port fd devid vitesse »),
+l'autre porte la session USB/IP. Plus de port 3240, plus d'import.
+
+**Compilation (décidé : hors de SteamBox).** Sunshine récupère
+libvirtualhid par CPM (`package-lock.cmake`, `LIBVIRTUALHID_COMMIT`) ; on
+peut le pointer vers une copie locale (`-DCPM_libvirtualhid_SOURCE=…`).
+ds5-usbip compilera libvirtualhid + backend USB/IP et Sunshine, et
+publiera le résultat en release ; SteamBox le récupérera comme ses autres
+composants précompilés (`prebuilt-fetch`), à la place de son étape
+`sunshine-usb`.
+
+**Haptiques.** Sunshine connaît l'adresse du client Moonlight : la
+destination RTP pourra être automatique (à prévoir dans le patch Sunshine),
+sinon une variable de configuration.
+
+**Point ouvert : l'attache depuis le conteneur.** Sunshine tourne dans
+SteamBox, où `/sys` est en lecture seule. Options, à décider par
+l'utilisateur (elles touchent l'hôte) :
+1. monter `/sys/devices/platform/vhci_hcd.0` en écriture dans SteamBox
+   (modèle Unraid) et donner l'accès à l'utilisateur de Sunshine ;
+2. un petit service root sur l'hôte qui reçoit la socket (SCM_RIGHTS) et
+   écrit dans `attach` ; SteamBox garde `/sys` en lecture seule ;
+3. variante de 2 dans SteamBox (service s6 root) : exige quand même 1.
+Test de faisabilité de 1 (montage en écriture dans un conteneur jetable)
+non lancé : bloqué par l'outil de sécurité, il touche au sysfs de l'hôte.
+
 ### Phase 3 — mise en production
 
 - Service s6 dans SteamBox (démarrage avec une session Moonlight, arrêt à la
