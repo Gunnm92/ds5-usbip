@@ -400,6 +400,9 @@ Corrections finales avant la phase 2 (22/11, 18 h) :
 
 ### À faire dans le projet AIBox (client)
 
+**Fait (23/11)** : scripts de démarrage de la manette ajoutés à AIBox
+(persistance des réglages client au redémarrage), selon l'utilisateur.
+
 Décidé le 22/11 : à traiter directement dans le dépôt AIBox, pas ici.
 
 1. Sortie du dongle à 100 % dès son apparition : ajouter
