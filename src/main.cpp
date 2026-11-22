@@ -325,6 +325,9 @@ namespace {
       "  -t, --haptics-to IP:PORT\n"
       "                      envoie les canaux haptiques 3-4 en RTP (L16 stéréo\n"
       "                      48 kHz, PT 127) vers le PC client\n"
+      "  -g, --haptics-gain G gain des haptiques envoyées (écrêtage doux), défaut 1\n"
+      "      --haptics-gain-file FICHIER\n"
+      "                      gain relu chaque seconde dans ce fichier (réglage à chaud)\n"
       "  -m, --mirror HIDRAW recopie les entrées de cette DualSense (test) ;\n"
       "                      « auto » : la DualSense uhid de Sunshine, suivie\n"
       "      --hide-mirror   remplace ensuite le nœud HIDRAW par un leurre /dev/null\n"
@@ -343,6 +346,8 @@ int main(int argc, char **argv) {
   std::string dump_path;
   std::string mirror_path;
   std::string haptics_to;
+  float haptics_gain = 1.0f;
+  std::string haptics_gain_file;
   bool hide_mirror = false;
 
   static const option long_options[] {
@@ -350,6 +355,8 @@ int main(int argc, char **argv) {
     {"port", required_argument, nullptr, 'p'},
     {"dump", required_argument, nullptr, 'd'},
     {"haptics-to", required_argument, nullptr, 't'},
+    {"haptics-gain", required_argument, nullptr, 'g'},
+    {"haptics-gain-file", required_argument, nullptr, 'G'},
     {"mirror", required_argument, nullptr, 'm'},
     {"hide-mirror", no_argument, nullptr, 'H'},
     {"verbose", no_argument, nullptr, 'v'},
@@ -357,7 +364,7 @@ int main(int argc, char **argv) {
     {nullptr, 0, nullptr, 0},
   };
   int c;
-  while ((c = getopt_long(argc, argv, "a:p:d:t:m:vh", long_options, nullptr)) != -1) {
+  while ((c = getopt_long(argc, argv, "a:p:d:t:g:m:vh", long_options, nullptr)) != -1) {
     switch (c) {
       case 'a':
         options.bind_address = optarg;
@@ -370,6 +377,12 @@ int main(int argc, char **argv) {
         break;
       case 't':
         haptics_to = optarg;
+        break;
+      case 'g':
+        haptics_gain = std::strtof(optarg, nullptr);
+        break;
+      case 'G':
+        haptics_gain_file = optarg;
         break;
       case 'm':
         mirror_path = optarg;
@@ -411,8 +424,11 @@ int main(int argc, char **argv) {
 
   AudioMeter meter(dump);
   ds5usbip::HapticsRtpSender haptics;
-  if (!haptics_to.empty() && !haptics.open(haptics_to)) {
-    return 1;
+  if (!haptics_to.empty()) {
+    if (!haptics.open(haptics_to)) {
+      return 1;
+    }
+    haptics.set_gain(haptics_gain, haptics_gain_file);
   }
   Mirror mirror(mirror_path, hide_mirror);
 

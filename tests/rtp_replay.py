@@ -25,6 +25,9 @@ pcm.frombytes(raw[: len(raw) // FRAME * FRAME])
 left, right = pcm[2::4], pcm[3::4]
 
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+TOS = int(__import__("os").environ.get("RTP_TOS", "0"), 0)  # ex. 0xb8 = DSCP EF, comme le serveur
+if TOS:
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, TOS)
 seq, ts, ssrc = random.getrandbits(16), random.getrandbits(32), random.getrandbits(32)
 
 

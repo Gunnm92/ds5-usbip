@@ -291,6 +291,7 @@ le client coupe le son de Moonlight (quitter la session avant).
    manette.
 
 **Critère** : haptiques ressenties dans RIDE 6, sans vibration permanente.
+→ atteint le 22/11 (ressenti sur F1 25, voir plus haut).
 
 **Point d'arrêt (22/11, 14 h)** — la chaîne fonctionne avec la vibration
 de test (sinus 80 Hz, amplitude 20 000), mais **en jeu (RIDE 6, tampon
@@ -359,6 +360,26 @@ durable en phase 3 (paquet AIBox).
 - Hors session de test : débrancher la manette émulée (`ds5-usbip-attach
   detach 0`), sinon seconde DualSense et sortie son par défaut dans
   SteamBox.
+
+**Phase 1 validée (22/11, 17 h 15)** : vibrations haptiques et gâchettes
+ressenties en jeu (F1 25), sans vibration permanente. Dernier obstacle :
+après un rebranchement de la manette émulée pendant que le jeu tournait,
+son flux haptique 4 canaux (« PipeWire ALSA [wine64-preloader] ») était
+resté sur la sortie par défaut (Sunshine 5.1 : canaux 3-4 sur FC/LFE,
+« petits bruits » dans le son du jeu) ; remis sur la DualSense par
+`pactl move-sink-input`. Gain à l'émission ×2 (`--haptics-gain-file
+/tmp/ds5-haptics-gain`, réglable à chaud).
+
+Recette qui marche aujourd'hui (à automatiser en phases 2-3) :
+- SteamBox : serveur avec `-t <IP client>:46100 --haptics-gain-file …`,
+  sortie DualSense à 100 %, manette branchée **avant** le lancement du jeu ;
+- AIBox : `ds5-usbip-haptics.conf` (40 ms, RL/RR), `ds5_dongle_sink` à
+  100 %, `ds5-haptics-loopback` arrêté, dongle en mode « Off ».
+
+À rendre durable : volume 100 % et priorité basse de la sortie DualSense
+(règle WirePlumber SteamBox) ; côté AIBox, volume du dongle, config RTP et
+désactivation du loopback quand ds5-usbip est utilisé (dépôt AIBox) ;
+réglage final du gain ; réduction de la latence (~50 ms).
 
 ### Phase 2 — intégration dans Sunshine (choix du 22/11)
 

@@ -7,6 +7,7 @@
 
 #include <netinet/in.h>
 
+#include <chrono>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -24,6 +25,11 @@ namespace ds5usbip {
     // destination « IP:PORT » ; false si invalide ou socket impossible.
     bool open(const std::string &destination);
 
+    // Gain appliqué aux haptiques avant envoi, avec écrêtage doux au-delà
+    // de la moitié de la pleine échelle. Si gain_file est donné, le gain y
+    // est relu chaque seconde (un nombre, ex. « 2.5 ») : réglage à chaud.
+    void set_gain(float gain, std::string gain_file = {});
+
     // Un paquet isochrone de la sortie audio : S16_LE, 4 canaux entrelacés.
     // N'envoie que les canaux 2 et 3 (haptiques gauche et droite).
     void send(std::span<const std::uint8_t> pcm4ch);
@@ -39,6 +45,12 @@ namespace ds5usbip {
     std::uint32_t timestamp_ = 0;
     std::uint32_t ssrc_ = 0;
     std::uint64_t packets_ = 0;
+    float gain_ = 1.0f;
+    std::string gain_file_;
+    std::chrono::steady_clock::time_point last_gain_check_ {};
+
+    void reload_gain();
+    static std::int16_t shape(std::int16_t sample, float gain);
   };
 
 }  // namespace ds5usbip

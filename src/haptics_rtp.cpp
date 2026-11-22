@@ -5,7 +5,10 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -48,6 +51,44 @@ namespace ds5usbip {
     return true;
   }
 
+  void HapticsRtpSender::set_gain(float gain, std::string gain_file) {
+    gain_ = gain > 0 ? gain : 1.0f;
+    gain_file_ = std::move(gain_file);
+    reload_gain();
+    std::fprintf(stderr, "haptiques : gain ×%.2f%s%s\n", gain_, gain_file_.empty() ? "" : ", réglable dans ", gain_file_.c_str());
+  }
+
+  void HapticsRtpSender::reload_gain() {
+    if (gain_file_.empty()) {
+      return;
+    }
+    std::FILE *f = std::fopen(gain_file_.c_str(), "r");
+    if (!f) {
+      return;
+    }
+    float g = 0;
+    if (std::fscanf(f, "%f", &g) == 1 && g > 0 && g <= 64 && g != gain_) {
+      gain_ = g;
+      std::fprintf(stderr, "haptiques : gain ×%.2f\n", gain_);
+    }
+    std::fclose(f);
+  }
+
+  // Gain puis écrêtage doux : linéaire jusqu'à la moitié de la pleine
+  // échelle, puis courbe tanh qui tend vers la pleine échelle sans cassure.
+  std::int16_t HapticsRtpSender::shape(std::int16_t sample, float gain) {
+    if (gain == 1.0f) {
+      return sample;
+    }
+    float x = sample / 32768.0f * gain;
+    const float a = std::fabs(x);
+    if (a > 0.5f) {
+      const float y = 0.5f + 0.5f * std::tanh((a - 0.5f) / 0.5f);
+      x = x < 0 ? -y : y;
+    }
+    return static_cast<std::int16_t>(std::lrint(std::clamp(x, -1.0f, 32767.0f / 32768.0f) * 32768.0f));
+  }
+
   void HapticsRtpSender::send(std::span<const std::uint8_t> pcm4ch) {
     if (fd_ < 0) {
       return;
@@ -66,14 +107,20 @@ namespace ds5usbip {
       pkt[4 + i] = static_cast<std::uint8_t>(timestamp_ >> (24 - 8 * i));
       pkt[8 + i] = static_cast<std::uint8_t>(ssrc_ >> (24 - 8 * i));
     }
-    // Canaux 2-3, S16_LE → S16_BE.
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_gain_check_ >= std::chrono::seconds(1)) {
+      last_gain_check_ = now;
+      reload_gain();
+    }
+    // Canaux 2-3, S16_LE → gain → S16_BE.
     for (std::size_t f = 0; f < frames; ++f) {
       const std::uint8_t *in = pcm4ch.data() + f * kInFrame + 4;
       std::uint8_t *out = pkt.data() + 12 + f * 4;
-      out[0] = in[1];
-      out[1] = in[0];
-      out[2] = in[3];
-      out[3] = in[2];
+      for (int c = 0; c < 2; ++c) {
+        const auto v = static_cast<std::uint16_t>(shape(static_cast<std::int16_t>(in[2 * c] | (in[2 * c + 1] << 8)), gain_));
+        out[2 * c] = static_cast<std::uint8_t>(v >> 8);
+        out[2 * c + 1] = static_cast<std::uint8_t>(v);
+      }
     }
     ::sendto(fd_, pkt.data(), pkt.size(), MSG_DONTWAIT, reinterpret_cast<const sockaddr *>(&dest_), sizeof(dest_));
     ++seq_;
