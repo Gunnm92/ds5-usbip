@@ -475,8 +475,20 @@ l'utilisateur (elles touchent l'hôte) :
 2. un petit service root sur l'hôte qui reçoit la socket (SCM_RIGHTS) et
    écrit dans `attach` ; SteamBox garde `/sys` en lecture seule ;
 3. variante de 2 dans SteamBox (service s6 root) : exige quand même 1.
-Test de faisabilité de 1 (montage en écriture dans un conteneur jetable)
-non lancé : bloqué par l'outil de sécurité, il touche au sysfs de l'hôte.
+**Option 1 retenue et testée (22/11, autorisée par l'utilisateur)** :
+conteneur jetable avec `-v /sys/devices/platform/vhci_hcd.0:/sys/devices/platform/vhci_hcd.0:rw`,
+écriture invalide dans `attach` → « Invalid argument » (l'écriture atteint
+le noyau). Contraintes :
+- `attach`/`detach` sont en `0200 root` ; Sunshine tourne en `arcade` et
+  abandonne ses capacités (`cap_sys_admin,cap_sys_nice` sur le binaire)
+  après son initialisation. L'init de SteamBox (root) fera
+  `chgrp input` + `chmod 0220` sur `attach` et `detach` (visible côté hôte
+  jusqu'au rechargement du module : le groupe peut brancher des
+  périphériques USB/IP).
+- Le dossier n'existe qu'une fois `vhci-hcd` chargé : sans lui, le
+  montage échoue et SteamBox ne démarre pas. Charger `vhci-hcd` et
+  `snd-usb-audio` dans le fichier `go` d'Unraid, avant Docker (phase 3,
+  par l'utilisateur).
 
 ### Phase 3 — mise en production
 
