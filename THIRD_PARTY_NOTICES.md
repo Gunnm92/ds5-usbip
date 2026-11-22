@@ -8,10 +8,10 @@ cette licence l'exige. Ils ne valent que pour les parties reprises.
 
 <https://github.com/hurryman2212/vds>
 
-Repris : descripteurs USB et HID de la DualSense (`src/dualsense_descriptors.hpp`),
-modèle de périphérique USB porté en C++ (`src/dualsense_device.*`, depuis
+Repris : descripteurs USB et HID de la DualSense (`src/usbip/dualsense_descriptors.hpp`),
+modèle de périphérique USB porté en C++ (`src/usbip/dualsense_device.*`, depuis
 `module/vds_usb_core.c`), principe du rythme isochrone de son export USB/IP
-Windows (`src/usbip_server.cpp`).
+Windows (`src/usbip/usbip_session.cpp`).
 
 ```
 MIT License
@@ -42,7 +42,7 @@ SOFTWARE.
 <https://github.com/LizardByte/libvirtualhid>
 
 Repris : contenu des rapports feature 0x05, 0x09 et 0x20 de la DualSense
-(`src/dualsense_descriptors.hpp`, depuis
+(`src/usbip/dualsense_descriptors.hpp`, depuis
 `src/shared/playstation_feature_reports.hpp`, partie sous MIT du dépôt).
 
 ```

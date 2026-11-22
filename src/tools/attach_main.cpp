@@ -1,27 +1,27 @@
 // SPDX-License-Identifier: MIT
-// ds5-usbip-attach : branche (ou débranche) un périphérique USB/IP sur
-// vhci-hcd, sans l'outil usbip. Même séquence que « usbip attach » :
-// OP_REQ_IMPORT sur TCP, puis « port sockfd devid speed » écrit dans
-// /sys/devices/platform/vhci_hcd.0/attach ; le noyau garde la socket.
-// À lancer en root sur la machine qui a vhci-hcd.
+// ds5-usbip-attach : attaches (or detaches) a USB/IP device on vhci-hcd,
+// without the usbip tool. Same sequence as "usbip attach": OP_REQ_IMPORT over
+// TCP, then "port sockfd devid speed" written to
+// /sys/devices/platform/vhci_hcd.0/attach; the kernel keeps the socket.
+// Run as root on the machine that has vhci-hcd.
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <sstream>
 #include <string>
 
-#include "usbip_protocol.hpp"
+#include "usbip/usbip_protocol.hpp"
+#include "usbip/vhci.hpp"
 
 namespace {
   using namespace ds5usbip::usbip;
-
-  constexpr const char *kVhci = "/sys/devices/platform/vhci_hcd.0";
+  namespace vhci = ds5usbip::vhci;
 
   bool recv_exact(int fd, void *buf, std::size_t len) {
     auto *p = static_cast<char *>(buf);
@@ -37,8 +37,8 @@ namespace {
   }
 
   int connect_to(const std::string &host, const std::string &port) {
-    // Adresse IPv4 littérale : sans getaddrinfo, qui dépend des modules NSS
-    // de la glibc de l'hôte dans un binaire statique.
+    // Literal IPv4 address: no getaddrinfo, which depends on the NSS modules
+    // of the host's glibc in a static binary.
     sockaddr_in sin {};
     if (::inet_pton(AF_INET, host.c_str(), &sin.sin_addr) == 1) {
       sin.sin_family = AF_INET;
@@ -79,39 +79,6 @@ namespace {
     return fd;
   }
 
-  // Premier port haute vitesse libre (statut 4 = VDEV_ST_NULL) du fichier
-  // status : « hub port sta spd dev sockfd local_busid ».
-  int free_hs_port() {
-    std::ifstream f(std::string(kVhci) + "/status");
-    if (!f) {
-      std::fprintf(stderr, "%s/status illisible : vhci-hcd est-il chargé ?\n", kVhci);
-      return -1;
-    }
-    std::string line;
-    std::getline(f, line);  // en-tête
-    while (std::getline(f, line)) {
-      std::istringstream in(line);
-      std::string hub;
-      int port = 0, status = 0;
-      if (in >> hub >> port >> status && hub == "hs" && status == 4) {
-        return port;
-      }
-    }
-    std::fprintf(stderr, "aucun port haute vitesse libre sur vhci-hcd\n");
-    return -1;
-  }
-
-  bool write_sysfs(const std::string &file, const std::string &value) {
-    std::ofstream f(std::string(kVhci) + "/" + file);
-    f << value;
-    f.flush();
-    if (!f) {
-      std::fprintf(stderr, "écriture de « %s » dans %s/%s refusée : %s\n", value.c_str(), kVhci, file.c_str(), std::strerror(errno));
-      return false;
-    }
-    return true;
-  }
-
   int attach(const std::string &host, const std::string &port, const std::string &busid) {
     const int fd = connect_to(host, port);
     if (fd < 0) {
@@ -135,15 +102,20 @@ namespace {
       std::fprintf(stderr, "réponse OP_REP_IMPORT incomplète\n");
       return 1;
     }
-    const int vport = free_hs_port();
-    if (vport < 0) {
+    const auto ports = vhci::load_ports();
+    if (!ports) {
+      std::fprintf(stderr, "%s/status illisible : vhci-hcd est-il chargé ?\n", std::string(vhci::kDefaultSysfs).c_str());
+      return 1;
+    }
+    const auto vport = vhci::pick_free_port(*ports);
+    if (!vport) {
+      std::fprintf(stderr, "aucun port haute vitesse libre sur vhci-hcd\n");
       return 1;
     }
     const auto devid = (ntohl(dev.busnum) << 16) | ntohl(dev.devnum);
-    const auto speed = ntohl(dev.speed);
-    std::ostringstream v;
-    v << vport << ' ' << fd << ' ' << devid << ' ' << speed;
-    if (!write_sysfs("attach", v.str())) {
+    const auto speed = static_cast<int>(ntohl(dev.speed));
+    if (const int err = vhci::attach_device(vhci::kDefaultSysfs, *vport, fd, devid, speed); err < 0) {
+      std::fprintf(stderr, "écriture de « attach » refusée : %s\n", std::strerror(-err));
       return 1;
     }
     std::printf(
@@ -151,9 +123,9 @@ namespace {
       busid.c_str(),
       ntohs(dev.idVendor),
       ntohs(dev.idProduct),
-      vport
+      *vport
     );
-    return 0;  // le noyau a pris sa référence sur la socket
+    return 0;  // the kernel holds its own reference on the socket
   }
 
   void usage(const char *argv0) {
@@ -182,13 +154,14 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (cmd == "status") {
-    std::ifstream f(std::string(kVhci) + "/status");
-    if (!f) {
-      std::fprintf(stderr, "%s/status illisible : vhci-hcd est-il chargé ?\n", kVhci);
+    const auto text = vhci::read_text(std::string(vhci::kDefaultSysfs) + "/status");
+    if (!text) {
+      std::fprintf(stderr, "%s/status illisible : vhci-hcd est-il chargé ?\n", std::string(vhci::kDefaultSysfs).c_str());
       return 1;
     }
+    std::istringstream lines(*text);
     std::string line;
-    while (std::getline(f, line)) {
+    while (std::getline(lines, line)) {
       if (line.rfind("hs", 0) != 0 || line.find(" 004 ") == std::string::npos) {
         std::puts(line.c_str());  // en-tête et ports occupés
       }
@@ -196,7 +169,12 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (cmd == "detach" && argc == 3) {
-    return write_sysfs("detach", argv[2]) ? 0 : 1;
+    const int err = vhci::detach_port(vhci::kDefaultSysfs, std::atoi(argv[2]));
+    if (err < 0) {
+      std::fprintf(stderr, "écriture de « detach » refusée : %s\n", std::strerror(-err));
+      return 1;
+    }
+    return 0;
   }
   if (cmd == "attach" && argc >= 3) {
     std::string host = argv[2], port = "3240", busid = "1-1";

@@ -18,7 +18,6 @@ jeu (Wine) ─► sortie DualSense ─► ds5-usbip ─RTP─► module-rtp-sour
 | Journal détaillé | coupé | marche / arrêt | `-v`, ou signal `SIGUSR1` (bascule) | **oui** (signal) |
 | Enregistrement PCM | `/tmp/ds5-audio.raw` | fichier S16_LE 4 canaux 48 kHz | `-d FICHIER` | non |
 | Écoute USB/IP | `127.0.0.1:3240` | adresse, port | `-a`, `-p` | non |
-| Recopie de la manette Sunshine (test, disparaît en phase 2) | `auto` + masquage | chemin hidraw, `auto` ; leurre `/dev/null` | `-m`, `--hide-mirror` | non |
 
 Format RTP fixe : L16 stéréo big-endian, 48 kHz, type de charge 127, 1 ms
 (48 trames) par paquet, marquage DSCP EF (`IP_TOS 0xb8`). Le marquage

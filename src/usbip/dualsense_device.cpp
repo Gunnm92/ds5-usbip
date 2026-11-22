@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: MIT
-// Port en C++ de module/vds_usb_core.c de vds (Copyright (C) 2026 Jihong Min,
-// licence MIT). Différences : les rapports feature viennent de valeurs fixes
-// (libvirtualhid) au lieu de la vraie manette, et le volume part de 0 dB.
+// C++ port of module/vds_usb_core.c from vds (Copyright (C) 2026 Jihong Min,
+// MIT License). Differences: the feature reports come from fixed values
+// (libvirtualhid) instead of the real controller, and the volume starts at 0 dB.
 #include "dualsense_device.hpp"
 
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <span>
 #include <string_view>
 
 namespace ds5usbip {
@@ -14,7 +15,7 @@ namespace ds5usbip {
   namespace {
     namespace ds = dualsense;
 
-    // Requêtes standard (USB 2.0, chapitre 9).
+    // Standard requests (USB 2.0, chapter 9).
     constexpr std::uint8_t kReqGetStatus = 0x00;
     constexpr std::uint8_t kReqClearFeature = 0x01;
     constexpr std::uint8_t kReqSetFeature = 0x03;
@@ -39,7 +40,7 @@ namespace ds5usbip {
     constexpr std::uint8_t kRecipMask = 0x1f;
     constexpr std::uint8_t kRecipInterface = 0x01;
 
-    // Requêtes de classe HID.
+    // HID class requests.
     constexpr std::uint8_t kHidGetReport = 0x01;
     constexpr std::uint8_t kHidGetIdle = 0x02;
     constexpr std::uint8_t kHidGetProtocol = 0x03;
@@ -50,7 +51,7 @@ namespace ds5usbip {
     constexpr std::uint8_t kHidReportOutput = 0x02;
     constexpr std::uint8_t kHidReportFeature = 0x03;
 
-    // Requêtes de classe UAC1 (Feature Unit).
+    // UAC1 class requests (Feature Unit).
     constexpr std::uint8_t kUacSetCur = 0x01;
     constexpr std::uint8_t kUacGetCur = 0x81;
     constexpr std::uint8_t kUacGetMin = 0x82;
@@ -59,7 +60,7 @@ namespace ds5usbip {
     constexpr std::uint8_t kUacFuMute = 0x01;
     constexpr std::uint8_t kUacFuVolume = 0x02;
 
-    // Volume UAC1 : 8.8 dB signé, de -100 dB à 0 dB par pas de 1 dB.
+    // UAC1 volume: signed 8.8 dB, from -100 dB to 0 dB in 1 dB steps.
     constexpr std::int16_t kVolumeMin = -100 * 256;
     constexpr std::int16_t kVolumeMax = 0;
     constexpr std::int16_t kVolumeRes = 0x0100;
@@ -119,17 +120,42 @@ namespace ds5usbip {
     };
   }
 
-  DualSenseDevice::DualSenseDevice(Callbacks callbacks):
+  DualSenseDevice::DualSenseDevice(DeviceConfig config, Callbacks callbacks):
       callbacks_(std::move(callbacks)),
+      feature_provider_(std::move(config.get_feature)),
+      input_provider_(std::move(config.input_provider)),
       input_report_(neutral_input_report()) {
+    // Empty, oversized or missing report descriptor: the built-in one.
+    std::span<const std::uint8_t> report = config.hid_report_descriptor;
+    if (report.empty() || report.size() > 0xffff) {
+      report = std::span(ds::kHidReportDescriptor);
+    }
+    hid_report_descriptor_.assign(report.begin(), report.end());
+    const auto length = static_cast<std::uint16_t>(hid_report_descriptor_.size());
+    const auto lo = static_cast<std::uint8_t>(length & 0xff);
+    const auto hi = static_cast<std::uint8_t>(length >> 8);
+
+    // Standalone HID descriptor (GET_DESCRIPTOR 0x21) and the copy embedded in
+    // the configuration descriptor: wDescriptorLength must match the report
+    // descriptor actually exported.
+    hid_descriptor_ = ds::kHidDescriptor;
+    hid_descriptor_[7] = lo;
+    hid_descriptor_[8] = hi;
+    config_descriptor_.assign(ds::kConfigurationDescriptor.begin(), ds::kConfigurationDescriptor.end());
+    static constexpr std::array<std::uint8_t, 7> kHidPrefix {0x09, 0x21, 0x11, 0x01, 0x00, 0x01, 0x22};
+    const auto embedded = std::search(config_descriptor_.begin(), config_descriptor_.end(), kHidPrefix.begin(), kHidPrefix.end());
+    if (embedded != config_descriptor_.end()) {
+      embedded[7] = lo;
+      embedded[8] = hi;
+    }
     reset();
   }
 
   DualSenseDevice::Report DualSenseDevice::neutral_input_report() {
-    // Rapport USB 0x01 (offsets avec l'octet de numéro de rapport) :
-    // 1-4 sticks, 5-6 gâchettes, 7 séquence, 8 croix (bits 0-3, 8 = relâchée)
-    // + boutons, 33 et 37 contacts du pavé (bit 7 = pas de contact),
-    // 53 batterie (bits 0-3 niveau, 4-7 état de charge).
+    // USB report 0x01 (offsets include the report id byte):
+    // 1-4 sticks, 5-6 triggers, 7 sequence, 8 d-pad (bits 0-3, 8 = released)
+    // + buttons, 33 and 37 touchpad contacts (bit 7 = no contact),
+    // 53 battery (bits 0-3 level, 4-7 charging state).
     Report r {};
     r[0] = ds::kInputReportId;
     r[1] = r[2] = r[3] = r[4] = 0x80;
@@ -168,6 +194,19 @@ namespace ds5usbip {
     return input_report_;
   }
 
+  DualSenseDevice::Report DualSenseDevice::current_input_report() {
+    if (input_provider_) {
+      // Called without holding mutex_: the provider may call set_input_report().
+      return input_provider_();
+    }
+    return next_input_report();
+  }
+
+  bool DualSenseDevice::configured() const {
+    std::lock_guard lock(mutex_);
+    return configuration_ != 0;
+  }
+
   void DualSenseDevice::interrupt_out(std::span<const std::uint8_t> report) {
     if (callbacks_.output_report && !report.empty()) {
       callbacks_.output_report(report);
@@ -200,7 +239,7 @@ namespace ds5usbip {
           case kDtDevice:
             return reply(ds::kDeviceDescriptor, setup.wLength);
           case kDtConfig:
-            return reply(ds::kConfigurationDescriptor, setup.wLength);
+            return reply(config_descriptor_, setup.wLength);
           case kDtDeviceQualifier:
             return reply(ds::kDeviceQualifierDescriptor, setup.wLength);
           case kDtString:
@@ -221,12 +260,12 @@ namespace ds5usbip {
             if (intf != ds::kHidInterface) {
               return stall();
             }
-            return reply(ds::kHidReportDescriptor, setup.wLength);
+            return reply(hid_report_descriptor_, setup.wLength);
           case kDtHid:
             if (intf != ds::kHidInterface) {
               return stall();
             }
-            return reply(ds::kHidDescriptor, setup.wLength);
+            return reply(hid_descriptor_, setup.wLength);
           default:
             return stall();
         }
@@ -311,6 +350,11 @@ namespace ds5usbip {
     switch (setup.bRequest) {
       case kHidGetReport:
         if (report_type == kHidReportFeature) {
+          if (feature_provider_) {
+            if (auto custom = feature_provider_(report_id)) {
+              return reply(*custom, setup.wLength);
+            }
+          }
           switch (report_id) {
             case 0x05:
               return reply(ds::kFeatureCalibration, setup.wLength);
@@ -320,8 +364,8 @@ namespace ds5usbip {
               return reply(ds::kFeatureFirmware, setup.wLength);
             default:
               {
-                // Rapport inconnu : rapport nul plutôt qu'un STALL, comme
-                // vds pour les rapports qui ne sont pas des features.
+                // Unknown report: a zero report rather than a STALL, as vds
+                // does for reports that are not features.
                 std::vector<std::uint8_t> zero(std::max<std::uint16_t>(setup.wLength, 1), 0);
                 zero[0] = report_id;
                 return reply(zero, setup.wLength);
@@ -329,7 +373,7 @@ namespace ds5usbip {
           }
         }
         if (report_type == kHidReportInput && report_id == ds::kInputReportId) {
-          const auto r = next_input_report();
+          const auto r = current_input_report();
           return reply(r, setup.wLength);
         }
         {

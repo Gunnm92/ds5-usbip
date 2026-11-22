@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: MIT
-// Serveur USB/IP exportant une DualSense émulée (un seul périphérique, busid
-// "1-1"). Gère OP_REQ_DEVLIST / OP_REQ_IMPORT puis les URB : contrôle,
-// interruption (HID) et isochrone (audio), avec UNLINK.
-//
-// Les réponses isochrones sont rythmées en temps réel (1 ms par paquet),
-// comme dans l'export USB/IP Windows de vds (src/platform/win32/vds_usbip.cc) :
-// sans cela snd-usb-audio, piloté par les fins d'URB, consommerait l'audio à
-// la vitesse du réseau. Les rapports HID d'entrée partent toutes les 4 ms,
-// comme une vraie DualSense en USB.
+// USB/IP server exporting an emulated DualSense (one device, busid "1-1").
+// Handles OP_REQ_DEVLIST / OP_REQ_IMPORT on TCP; after a successful import the
+// connected socket is handed to a ds5usbip::UsbipSession, one session at a time.
 #pragma once
 
 #include <atomic>
@@ -16,31 +10,37 @@
 #include <span>
 #include <string>
 
-#include "dualsense_device.hpp"
+#include "usbip/dualsense_device.hpp"
 
 namespace ds5usbip {
 
+  /** @brief TCP listener that exports one DualSense to USB/IP clients. */
   class UsbipServer {
   public:
+    /** @brief Listening options. */
     struct Options {
       std::string bind_address = "0.0.0.0";
       std::uint16_t port = 3240;
       bool verbose = false;
-      // Si fourni, remplace verbose et peut changer à chaud (SIGUSR1).
+      // If set, replaces verbose and can change at run time (SIGUSR1).
       const std::atomic<bool> *verbose_flag = nullptr;
     };
 
+    /** @brief Notifications for the tool. */
     struct Callbacks {
-      // Un paquet isochrone de sortie : PCM S16_LE entrelacé, 4 canaux.
+      // One isochronous output packet: S16_LE interleaved, 4 channels.
       std::function<void(std::span<const std::uint8_t> pcm)> audio_out;
-      // Début (true) / fin (false) d'une session importée.
+      // Start (true) / end (false) of an imported session.
       std::function<void(bool attached)> session;
     };
 
+    /** @brief Creates the server; nothing is bound until run(). */
     UsbipServer(DualSenseDevice &device, Options options, Callbacks callbacks = {});
 
-    // Boucle d'acceptation, bloquante, jusqu'à ce que stop passe à true.
-    // Renvoie 0, ou 1 si l'écoute est impossible.
+    /**
+     * @brief Accept loop, blocking until stop becomes true.
+     * @return 0, or 1 if the listening socket cannot be set up.
+     */
     int run(const std::atomic<bool> &stop);
 
   private:

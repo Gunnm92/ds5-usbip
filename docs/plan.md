@@ -505,6 +505,12 @@ le noyau). Contraintes :
   de la règle WirePlumber (f958479) sera annulé quand la release la
   fournira.
 
+Avancement (22/11, soir) : bibliothèque `src/usbip/` + outils `src/tools/`
+(dont `ds5-usbip-local`, branchement par socketpair sans TCP ; mode miroir
+retiré) ; socle libvirtualhid dans `libvirtualhid/` (`apply.sh`,
+`Dockerfile.test`, correctif 0001, `FACTS.md`), tests libvirtualhid verts
+en Docker (175/175 hors 21 tests exigeant /dev/uhid).
+
 Étapes : 1. backend `UsbipGamepad` (copie de libvirtualhid, testé seul
 dans SteamBox) ; 2. compilation et release dans sunshine-ds ; 3.
 récupération par SteamBox (commits locaux) ; 4. test en vrai (Moonlight,

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
-// Protocole USB/IP (côté serveur), d'après Documentation/usb/usbip_protocol.rst
-// du noyau Linux. Tous les champs sont big-endian sur le fil, sauf le paquet
-// SETUP (little-endian, format USB) et les données.
+// USB/IP wire protocol (server side), from Documentation/usb/usbip_protocol.rst
+// in the Linux kernel. All fields are big-endian on the wire, except the SETUP
+// packet (little-endian, USB format) and the data.
 #pragma once
 
 #include <arpa/inet.h>

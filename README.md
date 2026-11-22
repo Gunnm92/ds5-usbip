@@ -20,10 +20,26 @@ client et ressenties dans la manette (DS5Dongle). Prochaine étape :
 réglages durables, puis phase 2 (intégration dans Sunshine). Voir
 [docs/plan.md](docs/plan.md).
 
+## Organisation
+
+- `src/usbip/` : **bibliothèque** (namespace `ds5usbip`), copiable telle quelle
+  dans un autre projet : protocole USB/IP, modèle de DualSense, session URB,
+  helpers vhci-hcd, envoi RTP des haptiques. Aucune sortie console : les
+  messages passent par un `LogFn`.
+- `src/tools/` : programmes en ligne de commande (serveur TCP, attache, local).
+- `tests/cpp/` : tests C++ de la bibliothèque ; `tests/*.py` : tests Python.
+
+## Compilation
+
 ```sh
-make                              # build/ds5-usbip-proto (statique)
-build/ds5-usbip-proto --help
-tests/usbip_client_test.py        # test du protocole, serveur lancé
+make                              # build/ds5-usbip-proto, build/ds5-usbip-attach,
+                                  # build/ds5-usbip-local (statiques)
+build/ds5-usbip-proto --help      # serveur USB/IP sur TCP (SteamBox)
+build/ds5-usbip-attach status     # hôte : attache au vhci-hcd (remplace « usbip attach »)
+build/ds5-usbip-local --help      # attache locale par socketpair, sans réseau
+make test                         # tests C++ de la bibliothèque (build/session_test)
+make check-cxx23                  # la bibliothèque compile aussi en C++23
+tests/usbip_client_test.py        # test du protocole, serveur lancé (voir l'en-tête)
 ```
 
 Réglages de la chaîne haptique : [docs/parametres.md](docs/parametres.md).

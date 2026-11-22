@@ -1,0 +1,61 @@
+# libvirtualhid facts for the DS5 USB/IP backend
+
+Pinned commit: `dd8153df338c6fb399ea4a048fa97b4c536f12a0` (Sunshine `LIBVIRTUALHID_COMMIT`).
+Line numbers refer to the pinned commit, not to the patched tree (patch 0001 changes the line numbers of `uhid_backend.cpp` from line 3142 onward).
+Checkout: `/config/workspace/libvirtualhid`, branch `ds5-usbip` (pinned commit plus local patch commit `ea4c8cd`).
+
+## 1. Exceptions and `-fno-exceptions`
+
+- **Does not compile with `-fno-exceptions`.** `src/core/runtime.cpp:58-60` uses `try { callback_(level, message); } catch (...)`. Checked locally with `g++ -std=c++23 -fno-exceptions -fsyntax-only -Isrc/include -Isrc src/core/runtime.cpp`: `error: exception handling disabled, use '-fexceptions' to enable` at `runtime.cpp:60`.
+- Exceptions used in `src/`: only that one `try/catch(...)` (`runtime.cpp:58-60`). No `throw` in `src/`. The library is written with `noexcept` (87 occurrences in `src/`) and status objects (`OperationStatus`), so exceptions are a small, localized dependency.
+- Tests use exceptions freely (`tests/unit/test_linux_consumers.cpp:107-111`, `tests/unit/test_runtime.cpp:88`).
+- Build flags do not disable exceptions (`CMakeLists.txt`, `src/CMakeLists.txt`, `tests/CMakeLists.txt` contain no `-fno-exceptions`).
+
+## 2. Test hook mechanism
+
+- Macro redefinitions: `tests/fixtures/linux_backend_test_hooks.cpp:557-576` defines, for the Linux backend, `access`, `ioctl`, `open`, `poll`, `read`, `write` (lines 558-563), plus libevdev functions (`libevdev_enable_event_code`, `libevdev_enable_event_type`, `libevdev_enable_property`, `libevdev_free`, `libevdev_new`, `libevdev_set_id_*`, `libevdev_set_name`, `libevdev_uinput_create_from_device`, `libevdev_uinput_destroy`, `libevdev_uinput_get_devnode`; lines 564-576). When `LIBVIRTUALHID_HAVE_XTEST` is set, X11 symbols are also redefined (lines 578-601: `XOpenDisplay`, `XTestFakeKeyEvent`, etc.).
+- `uhid_backend.cpp` is included at `linux_backend_test_hooks.cpp:603-604` (`#define create_platform_backend create_platform_backend_for_linux_backend_test_hooks` followed by `#include "../../src/platform/linux/uhid_backend.cpp"`), inside the `#if defined(__linux__)` block that starts at line 65. The include happens at file scope, so the `lvh::detail` namespace and the anonymous namespace of `uhid_backend.cpp` become visible to the wrappers. Macros are undone at lines 606-635 (`#undef write`, `#undef read`, ...).
+- Wrapper functions live in `namespace lvh::detail::test` (`linux_backend_test_hooks.cpp:642` onward). Each one is a free function that calls backend internals directly, e.g. `linux_dualsense_mac_address` (defined at `:1087`) and `linux_dualsense_uhid_socketpair_reports` (defined at `:2036`, builds a `UhidGamepad` on a `socketpair` and exchanges UHID events).
+- Adding a wrapper: (a) declare it with a Doxygen comment in `tests/fixtures/include/fixtures/linux_backend_test_hooks.hpp` inside `namespace lvh::detail::test` (existing examples at `:728` and `:1115`); (b) define it in `tests/fixtures/linux_backend_test_hooks.cpp` inside the `namespace lvh::detail::test` block, after the `uhid_backend.cpp` include, so it can call internals (examples at `:1087`, `:2036`, `:2130`). Any new `.cpp` that calls internals must also be included in the same TU, so put new internal-facing code in that fixture or in a new fixture included the same way.
+- Registering tests: `tests/unit/test_linux_backend.cpp` includes `fixtures/linux_backend_test_hooks.hpp` at line 31 and defines tests with `TEST_F(LinuxBackendTest, Name)` (`class LinuxBackendTest: public LinuxTest {}` at line 36). DualSense feature-report test: `TEST_F(LinuxBackendTest, SocketpairBackedDualSenseRepliesToFeatureReports)` at `:1101`; Bluetooth framing test at `:1118`.
+- New test source files: add to `LIBVIRTUALHID_TEST_SOURCES` in the Linux branch of `tests/CMakeLists.txt:66-70` (fixture at line 68, `test_linux_backend.cpp` at line 69, `test_linux_consumers.cpp` at line 70). Test discovery is `gtest_discover_tests(${TEST_BINARY})` at `tests/CMakeLists.txt:208`.
+
+## 3. DualSense USB input report: time-dependent fields and periodic repacking
+
+- Time-dependent, yes, in both USB and Bluetooth framing (`pack_dualsense_input_report`, `src/core/report.cpp:755`):
+  - Sequence counter: `dualsense_sequence_number()` (`report.cpp:650-653`), a process-wide `static std::atomic_uint32_t` that increments on each call and wraps with `% 255`. Written at `report.cpp:775` (`payload_offset + 6`).
+  - Sensor timestamp: `dualsense_sensor_timestamp()` (`report.cpp:655-660`), derived from `steady_clock` in units of 1/3 microsecond. Written at `report.cpp:836` (`payload_offset + 27`, u32).
+- Also time-dependent in DualShock 4 (`dualshock4_sensor_timestamp`, `report.cpp:643-649`, written at `:734`).
+- Periodic repacking: `UhidGamepad::periodic_report_loop` (`uhid_backend.cpp:3451-3469`) sleeps `playstation_periodic_report_ms` (10 ms, `uhid_backend.cpp:117`) and calls `reports::pack_input_report(profile_, last_state_)` at `:3464`, then `write_input_report`. It runs for every PlayStation profile and for Switch Pro (`uhid_backend.cpp:3226-3230` start condition; the 15 ms Switch Pro interval is at `:118`).
+- Consequence for USB/IP: a DualSense USB/IP backend that bypasses `pack_input_report` must reproduce the sequence and timestamp semantics itself if the host checks them. Identical bytes are not possible across runs (timestamp), so any byte-level test must mask them: USB report bytes 7 (sequence) and 28..31 (timestamp); Bluetooth report bytes 8 and 29..32 (`payload_offset` is 1 for USB, 2 for Bluetooth).
+
+## 4. `create_gamepad` and where to insert the USB/IP attempt
+
+- Linux entry point: `LinuxUhidBackend::create_gamepad(DeviceId id, const CreateGamepadOptions &options)` at `src/platform/linux/uhid_backend.cpp:3670`. The `#if defined(__linux__)` block starts at `:3671`, and the first branch is `if (prefers_uhid_gamepad_profile(options.profile.gamepad_kind))` at `:3672`.
+- Insert the USB/IP attempt between `:3671` (`#if defined(__linux__)`) and `:3672`, before the UHID branch. That keeps it ahead of `/dev/uhid` and `/dev/uinput` fallback. On failure it must fall through (not return) unless the profile is USB/IP-only, mirroring the UHID branch's use of `uses_uinput_gamepad_profile`.
+- Detect the profile: `options.profile.gamepad_kind == GamepadProfileKind::dualsense && options.profile.bus_type == BusType::usb`. Enum: `src/include/libvirtualhid/types.hpp:244-251` (`BusType::usb`), `:253-262` (`GamepadProfileKind::dualsense`). The USB DualSense profile is `profiles::dualsense_usb()` (`src/core/profiles.cpp:2123-2125`, `make_dualsense_profile(BusType::usb)`), declared in `src/include/libvirtualhid/profiles.hpp:91`.
+- `prefers_uhid_gamepad_profile` is at `uhid_backend.cpp:292`; `is_playstation_profile` at `:260-262`.
+
+## 5. CMake sources, language standard, flags
+
+- Library source list: `src/CMakeLists.txt`, function `libvirtualhid_add_library`. Core sources at lines 32-38. Linux sources are in the `if(LIBVIRTUALHID_USES_THREADS)` branch (`src/CMakeLists.txt:41-70`, with the Linux entries at lines 67-70) (`platform/linux/uhid_backend.cpp` at line 69, `platform/linux/output_mapping.cpp` at line 70). Add new `usbip/*.cpp` there, e.g. `"${CMAKE_CURRENT_FUNCTION_LIST_DIR}/platform/linux/usbip/<file>.cpp"`. The same list is reused for the test library (`libvirtualhid_add_library(libvirtualhid_test)` at `tests/CMakeLists.txt:33`).
+- Standard: `CMakeLists.txt:14` `set(CMAKE_CXX_STANDARD 23)`, `:15` `REQUIRED ON`, `:16` `EXTENSIONS OFF`. Per target: `src/CMakeLists.txt:3` `target_compile_features(... PUBLIC cxx_std_23)`.
+- Flags (`src/CMakeLists.txt:21-23`): `-Wall -Wextra -Wpedantic`; with `LIBVIRTUALHID_WARNINGS_AS_ERRORS`, `-Werror`. Test-only: `-fprofile-arcs -ftest-coverage -ggdb -O0` (non-MSVC, `tests/CMakeLists.txt:29-30`).
+- The include path for `shared/...` and `platform/...` is the library's own source dir (`src/CMakeLists.txt`, `target_include_directories(... PRIVATE "${CMAKE_CURRENT_FUNCTION_LIST_DIR}")`), so `#include "shared/playstation_feature_reports.hpp"` resolves.
+
+## 6. Cache options and CPM
+
+- Tests: `option(BUILD_TESTS "Build tests" ...)` at `CMakeLists.txt:37`. Warnings: `option(LIBVIRTUALHID_WARNINGS_AS_ERRORS ...)` at `CMakeLists.txt:55`. Also `BUILD_DOCS` (`:35`), `BUILD_EXAMPLES` (`:36`), `LIBVIRTUALHID_BUILD_TOOLS` (`:38`) are top-level defaults.
+- Linux test dependencies (tested in Docker, see `Dockerfile.test`): libevdev, libinput, sdl2 (`tests/CMakeLists.txt:58-60`, `pkg_check_modules REQUIRED`), SDL3 built by CPM from `package-lock.cmake` (SDL3 3.4.12, static), GoogleTest and lizardbyte-common from `third-party/` submodules (run `git submodule update --init --recursive`). The CPM-built SDL3 configure stops on missing X11 dev packages (first failure: XRANDR), so the image installs `libxrandr`, `libxcursor`, `libxi`, `libxss`, `libxext`, `libxkbcommon`, `wayland`, `wayland-protocols`, `vulkan-headers` in addition to the base set.
+- CPM package name in Sunshine: `libvirtualhid` (Sunshine's package lock variable `LIBVIRTUALHID_COMMIT`). The libvirtualhid tree itself does not declare a CPM package for itself, so this name is only visible from Sunshine. Standard CPM behaviour is that `CPM_<NAME>_SOURCE` overrides the source location, so `-DCPM_libvirtualhid_SOURCE=/path/to/libvirtualhid` should work; I have not verified this against a Sunshine checkout (none in this environment).
+
+## 7. Differences between pinned commit and master
+
+- `git fetch origin`: `origin/master` is `82270d4`, 3 commits ahead of `dd8153d`.
+- `src/platform/linux/uhid_backend.cpp` is byte-identical between `dd8153d` and `origin/master` (`git diff --quiet` exits 0). The 3 commits touch other files (5 insertions, 26 deletions in total, none in the Linux UHID backend).
+- So the pinned commit and master are equivalent for `UhidGamepad`; a patch made against `dd8153d` applies to master as well, but rebase is still needed when Sunshine moves its pin.
+
+## 8. Docker test results (for the record)
+
+- Baseline (pinned, no patch) and patched trees configure with `-DBUILD_TESTS=ON -DLIBVIRTUALHID_WARNINGS_AS_ERRORS=ON` and build.
+- ctest: 175 tests pass. 21 tests are excluded because they need `/dev/uhid` or `/dev/uinput` on the host (the `LinuxRuntimeTest.Linux{Uhid,Uinput}SmokeTestRequiresPrerequisites` tests and 19 `LinuxConsumerTest` tests). These fail in the BuildKit container because it has no such devices; see `LVH_DEVICE_TESTS` in `Dockerfile.test`.

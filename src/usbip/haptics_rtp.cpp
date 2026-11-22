@@ -6,16 +6,19 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <format>
 #include <random>
 #include <vector>
 
 namespace ds5usbip {
+
+  HapticsRtpSender::HapticsRtpSender(LogFn log):
+      log_(std::move(log)) {}
 
   HapticsRtpSender::~HapticsRtpSender() {
     if (fd_ >= 0) {
@@ -23,31 +26,43 @@ namespace ds5usbip {
     }
   }
 
-  bool HapticsRtpSender::open(const std::string &destination) {
-    const auto colon = destination.rfind(':');
+  void HapticsRtpSender::log(const std::string &msg) const {
+    if (log_) {
+      log_(msg);
+    }
+  }
+
+  bool HapticsRtpSender::set_destination(const std::string &ip_port) {
+    const auto colon = ip_port.rfind(':');
     if (colon == std::string::npos) {
-      std::fprintf(stderr, "haptiques : destination attendue IP:PORT, reçu « %s »\n", destination.c_str());
+      log(std::format("haptiques : destination attendue IP:PORT, reçu « {} »", ip_port));
       return false;
     }
-    dest_.sin_family = AF_INET;
-    dest_.sin_port = htons(static_cast<std::uint16_t>(std::atoi(destination.c_str() + colon + 1)));
-    if (::inet_pton(AF_INET, destination.substr(0, colon).c_str(), &dest_.sin_addr) != 1 || dest_.sin_port == 0) {
-      std::fprintf(stderr, "haptiques : destination invalide « %s »\n", destination.c_str());
+    sockaddr_in dest {};
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons(static_cast<std::uint16_t>(std::atoi(ip_port.c_str() + colon + 1)));
+    if (::inet_pton(AF_INET, ip_port.substr(0, colon).c_str(), &dest.sin_addr) != 1 || dest.sin_port == 0) {
+      log(std::format("haptiques : destination invalide « {} »", ip_port));
       return false;
     }
-    fd_ = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-    if (fd_ < 0) {
-      std::fprintf(stderr, "haptiques : socket : %s\n", std::strerror(errno));
+    const int fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+      log(std::format("haptiques : socket : {}", std::strerror(errno)));
       return false;
     }
-    // Priorité réseau élevée (DSCP EF), comme l'audio temps réel.
+    if (fd_ >= 0) {
+      ::close(fd_);
+    }
+    fd_ = fd;
+    dest_ = dest;
+    // High network priority (DSCP EF), like real-time audio.
     const int tos = 0xb8;
     ::setsockopt(fd_, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
     std::random_device rd;
     ssrc_ = rd();
     seq_ = static_cast<std::uint16_t>(rd());
     timestamp_ = rd();
-    std::fprintf(stderr, "haptiques : RTP L16 stéréo 48 kHz vers %s (PT %u)\n", destination.c_str(), kPayloadType);
+    log(std::format("haptiques : RTP L16 stéréo 48 kHz vers {} (PT {})", ip_port, kPayloadType));
     return true;
   }
 
@@ -55,7 +70,7 @@ namespace ds5usbip {
     gain_ = gain > 0 ? gain : 1.0f;
     gain_file_ = std::move(gain_file);
     reload_gain();
-    std::fprintf(stderr, "haptiques : gain ×%.2f%s%s\n", gain_, gain_file_.empty() ? "" : ", réglable dans ", gain_file_.c_str());
+    log(std::format("haptiques : gain ×{:.2f}{}{}", gain_, gain_file_.empty() ? "" : ", réglable dans ", gain_file_));
   }
 
   void HapticsRtpSender::reload_gain() {
@@ -69,13 +84,13 @@ namespace ds5usbip {
     float g = 0;
     if (std::fscanf(f, "%f", &g) == 1 && g > 0 && g <= 64 && g != gain_) {
       gain_ = g;
-      std::fprintf(stderr, "haptiques : gain ×%.2f\n", gain_);
+      log(std::format("haptiques : gain ×{:.2f}", gain_));
     }
     std::fclose(f);
   }
 
-  // Gain puis écrêtage doux : linéaire jusqu'à la moitié de la pleine
-  // échelle, puis courbe tanh qui tend vers la pleine échelle sans cassure.
+  // Gain, then soft clipping: linear up to half of full scale, then a tanh
+  // curve that approaches full scale without a break.
   std::int16_t HapticsRtpSender::shape(std::int16_t sample, float gain) {
     if (gain == 1.0f) {
       return sample;
@@ -93,7 +108,7 @@ namespace ds5usbip {
     if (fd_ < 0) {
       return;
     }
-    constexpr std::size_t kInFrame = 8;  // 4 canaux × 2 octets
+    constexpr std::size_t kInFrame = 8;  // 4 channels x 2 bytes
     const std::size_t frames = pcm4ch.size() / kInFrame;
     if (!frames) {
       return;
@@ -112,7 +127,7 @@ namespace ds5usbip {
       last_gain_check_ = now;
       reload_gain();
     }
-    // Canaux 2-3, S16_LE → gain → S16_BE.
+    // Channels 2-3, S16_LE -> gain -> S16_BE.
     for (std::size_t f = 0; f < frames; ++f) {
       const std::uint8_t *in = pcm4ch.data() + f * kInFrame + 4;
       std::uint8_t *out = pkt.data() + 12 + f * 4;

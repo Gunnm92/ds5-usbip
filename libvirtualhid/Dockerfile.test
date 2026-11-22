@@ -1,0 +1,46 @@
+# Build and test libvirtualhid (Linux backend) from a patched source tree.
+# Build context: a libvirtualhid checkout (with submodules) at the pinned commit plus patches.
+#   docker buildx build --builder default --progress plain \
+#     -f /config/workspace/ds5-usbip/libvirtualhid/Dockerfile.test /config/workspace/libvirtualhid
+# The image build fails if the configure, build, or ctest step fails.
+FROM cachyos/cachyos-v3:latest
+
+# The BuildKit sandbox forbids the package hooks' network isolation; disable pacman's sandbox.
+RUN sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf \
+ && pacman -Syu --noconfirm --needed \
+      base-devel \
+      clang \
+      cmake \
+      git \
+      glib2 \
+      libevdev \
+      libinput \
+      libx11 \
+      libxtst \
+      ninja \
+      pkgconf \
+      sdl2 \
+      libxcursor \
+      libxext \
+      libxi \
+      libxkbcommon \
+      libxrandr \
+      libxss \
+      vulkan-headers \
+      wayland \
+      wayland-protocols
+
+COPY . /lvh
+WORKDIR /lvh
+
+# Tests that open the host's /dev/uhid or /dev/uinput (or drive SDL/libinput on the devices they create).
+# The build container has neither device, so these are excluded. Everything else must pass.
+ENV LVH_DEVICE_TESTS='^(LinuxRuntimeTest\.LinuxUhidSmokeTestRequiresPrerequisites|LinuxRuntimeTest\.LinuxUinputSmokeTestRequiresPrerequisites|LinuxConsumerTest\.(SdlSeesGenericCanonicalButtons|SdlSeesXbox360CanonicalButtons|SdlSeesXboxOneCanonicalButtons|SdlSeesXboxGuideChordsWithXpadneoShiftMode|SdlSeesXboxSeriesCanonicalButtons|Sdl3SeesXboxOneIdentityMappingsAndFourMotorRumble|Sdl3SeesXboxSeriesIdentityMappingsAndFourMotorRumble|SdlSeesSwitchProCanonicalButtons|SdlKeepsIdleSwitchProConnected|SdlSeesDualSenseUsbControllerBehavior|SdlSeesDualShock4UsbControllerBehavior|SdlSeesDualShock4BluetoothControllerBehavior|SdlSeesDualSenseBluetoothControllerDiscovery|LibinputSeesUinputKeyboardKeys|UinputKeyboardKeepsReleasedKeyUpUnderRapidTransitions|LibinputSeesSplitUinputMouseMotionAndButtons|LibinputSeesUinputTouchscreenContacts|LibinputSeesUinputTrackpadButton|LibinputSeesUinputPenTabletTool))$'
+
+RUN cmake -S /lvh -B /lvh/build -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_TESTS=ON \
+      -DBUILD_DOCS=OFF \
+      -DLIBVIRTUALHID_WARNINGS_AS_ERRORS=ON \
+ && cmake --build /lvh/build --parallel \
+ && ctest --test-dir /lvh/build --output-on-failure -E "${LVH_DEVICE_TESTS}"
