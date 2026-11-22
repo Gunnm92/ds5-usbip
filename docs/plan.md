@@ -407,7 +407,11 @@ Décidé le 22/11 : à traiter directement dans le dépôt AIBox, pas ici.
    `51-ds5dongle.conf` (à 40 %, les haptiques perdaient 24 dB).
 2. Réception RTP : intégrer `client/pipewire/ds5-usbip-haptics.conf`
    (tampon 40 ms, `[ RL RR ]`, port 46100) à l'image.
-3. `ds5-haptics-loopback` (vibration tirée du son, dongle en « Replace »)
+3. Le récepteur RTP ne doit jamais se rabattre sur une autre sortie quand
+   le dongle manque ; `node.dont-reconnect` et `node.dont-fallback` cassent
+   la liaison (22/11) : règle WirePlumber à écrire. AIBox n'est pas
+   persistant (récepteur, volume du dongle, loopback perdus au redémarrage).
+4. `ds5-haptics-loopback` (vibration tirée du son, dongle en « Replace »)
    et ds5-usbip (haptiques natives, dongle en « Off ») s'excluent : le
    service relancé par udev à chaque reconnexion du dongle renvoie le son
    du jeu dans le haut-parleur de la manette. Choisir : ds5-usbip seul,
