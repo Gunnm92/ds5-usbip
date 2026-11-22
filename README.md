@@ -26,5 +26,7 @@ build/ds5-usbip-proto --help
 tests/usbip_client_test.py        # test du protocole, serveur lancé
 ```
 
+Réglages de la chaîne haptique : [docs/parametres.md](docs/parametres.md).
+
 Code repris de vds et de libvirtualhid (MIT) : voir
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
