@@ -59,3 +59,35 @@ Checkout: `/config/workspace/libvirtualhid`, branch `ds5-usbip` (pinned commit p
 
 - Baseline (pinned, no patch) and patched trees configure with `-DBUILD_TESTS=ON -DLIBVIRTUALHID_WARNINGS_AS_ERRORS=ON` and build.
 - ctest: 175 tests pass. 21 tests are excluded because they need `/dev/uhid` or `/dev/uinput` on the host (the `LinuxRuntimeTest.Linux{Uhid,Uinput}SmokeTestRequiresPrerequisites` tests and 19 `LinuxConsumerTest` tests). These fail in the BuildKit container because it has no such devices; see `LVH_DEVICE_TESTS` in `Dockerfile.test`.
+
+## 9. UsbipGamepad (patch 0002)
+
+Selection and fallback:
+- Used only for `GamepadProfileKind::dualsense` with `BusType::usb`, when `LIBVIRTUALHID_DUALSENSE_USBIP=1`. It is tried first in `LinuxUhidBackend::create_gamepad`. On failure one line goes to stderr, `libvirtualhid: DualSense USB/IP unavailable (<reason>), using uhid`, and the uhid path runs unchanged. Reasons: `vhci-hcd not loaded or attach not writable`, `socketpair failed: ...`, `failed to start the USB/IP session`, `vhci-hcd status is unreadable`, `no free high-speed vhci port`, `attach write failed: ...` (any errno but EBUSY), `vhci-hcd ports stayed busy` (three EBUSY attaches), `vhci-hcd closed the connection before enumeration`, `enumeration timeout` (no SET_CONFIGURATION within 2 s).
+
+Environment variables:
+- `LIBVIRTUALHID_DUALSENSE_USBIP=1`: enables the backend.
+- `LIBVIRTUALHID_VHCI_SYSFS`: vhci-hcd sysfs directory (default `/sys/devices/platform/vhci_hcd.0`). Needs `status`, `attach`, `detach`.
+- `LIBVIRTUALHID_DUALSENSE_HAPTICS_RTP=IP:PORT`: sends haptic channels 3-4 as RTP (library `HapticsRtpSender`). An invalid destination disables haptics with a stderr line.
+- `LIBVIRTUALHID_DUALSENSE_HAPTICS_GAIN=<float>` (default 1) and `LIBVIRTUALHID_DUALSENSE_HAPTICS_GAIN_FILE=<path>` (re-read every second by the library).
+
+Attach and teardown:
+- Socketpair: `pair[0]` goes to `UsbipSession`, `pair[1]` is written as `port fd 0x10001 3` to `attach`, then closed (vhci-hcd keeps its own reference). Ports come from `status` (first free `hs` port, skipping busy ones).
+- Enumeration is complete when the host sends SET_CONFIGURATION (`DualSenseDevice::configured()`), polled every 10 ms.
+- `close()`: writes the port to `detach` (best effort), stops the session (shutdown + close, so the peer reads EOF), joins the dispatcher, drops queued reports and destroys the haptics sender. Idempotent; the destructor calls it.
+
+Threads:
+- Caller thread: `create`, `submit`, `device_nodes`, `close`.
+- Library session threads: reader (control, interrupt OUT, SET_REPORT, audio callback that feeds haptics) and timer (HID IN every 4 ms, which packs the report from the last submitted state with a fresh sequence number and timestamp).
+- Dispatcher (`std::jthread`): the only thread that calls the `OutputCallback`. Output and SET_REPORT(feature) bytes are queued in a 256-entry FIFO; when full, the oldest is dropped and the drop count is logged at close.
+
+Feature reports: GET_REPORT(feature) is answered by `playstation_feature_report` (same table as uhid, MAC from `stable_id`). SET_REPORT(feature) data is queued like output; it already starts with the report id, so this matches uhid's `dispatch_set_report` for the same bytes.
+
+Known limitations:
+- Only the USB DualSense profile. No Bluetooth, no hotplug, no re-attach after vhci-hcd drops the port.
+- Detach is best effort and the port is not polled until free; the session close is what guarantees unplug.
+- `device_nodes()` scans the first high-speed `usbN` (speed 480) for `N-<port+1>:1.3/0003:*`. Only the test fake tree covers it, not a real `/sys` layout.
+- Tests use a fake sysfs and a socketpair; nothing has been attached to a real vhci-hcd or a real host here.
+- The dispatcher-thread check asserts only that the callback is not on the caller thread. Library session threads are private, so their IDs cannot be compared.
+- Library defect: `UsbipSession` (`src/usbip/usbip_session.cpp`) reads `hid_in_count_` in `reader_loop` (for the final log) while `timer_loop` increments it without synchronisation. This is a data race; see the TSan notes in the report.
+- Library difference: GET_REPORT(feature) with an unknown id returns a zero report, while uhid returns EINVAL.

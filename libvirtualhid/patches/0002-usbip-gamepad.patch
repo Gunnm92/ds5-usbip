@@ -1,0 +1,1458 @@
+From f30a32f6717f1a4b152e82376dfa6cc9ba7235f4 Mon Sep 17 00:00:00 2001
+From: Gunnm92 <gunnm44@gmail.com>
+Date: Sun, 22 Nov 2026 19:18:11 +0100
+Subject: [PATCH] feat(linux): DualSense USB/IP backend via vhci-hcd
+
+Add UsbipGamepad, selected for the USB DualSense profile when
+LIBVIRTUALHID_DUALSENSE_USBIP=1. The emulated device is served by the
+ds5usbip library (DualSenseDevice, UsbipSession) on one end of a
+socketpair, and the other end is attached to vhci-hcd through its
+attach file. On any failure the one-line reason goes to stderr and the
+existing uhid path is used.
+
+Output reports are queued from the session threads and dispatched by a
+worker thread, so the output callback never runs on a session thread.
+
+Tests drive the vhci side of the socketpair from the fixture: attach
+line, descriptors, SET_CONFIGURATION, input reports, a 200-report
+output burst, the pairing feature report and close.
+
+Co-Authored-By: Claude Haiku 5.5 <noreply@anthropic.com>
+---
+ src/CMakeLists.txt                            |   8 +
+ src/platform/linux/uhid_backend.cpp           | 599 ++++++++++++++++++
+ .../fixtures/linux_backend_test_hooks.hpp     |  60 ++
+ tests/fixtures/linux_backend_test_hooks.cpp   | 460 ++++++++++++++
+ tests/unit/test_linux_backend.cpp             | 152 +++++
+ 5 files changed, 1279 insertions(+)
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index d03952b..11d2a22 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -68,6 +68,14 @@ function(libvirtualhid_add_library target_name)
+           PRIVATE
+           "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/platform/linux/uhid_backend.cpp"
+           "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/platform/linux/output_mapping.cpp")
++        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
++          target_sources(${target_name}
++            PRIVATE
++            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/platform/linux/usbip/dualsense_device.cpp"
++            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/platform/linux/usbip/haptics_rtp.cpp"
++            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/platform/linux/usbip/usbip_session.cpp"
++            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/platform/linux/usbip/vhci.cpp")
++        endif()
+         target_link_libraries(${target_name}
+           PUBLIC
+           Threads::Threads
+diff --git a/src/platform/linux/uhid_backend.cpp b/src/platform/linux/uhid_backend.cpp
+index f72d0de..6cf6e6f 100644
+--- a/src/platform/linux/uhid_backend.cpp
++++ b/src/platform/linux/uhid_backend.cpp
+@@ -13,7 +13,10 @@
+ #include <condition_variable>
+ #include <cstddef>
+ #include <cstdint>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
++#include <deque>
+ #include <filesystem>
+ #include <format>
+ #include <fstream>
+@@ -68,6 +71,11 @@
+ #if defined(__linux__)
+   #include "shared/playstation_feature_reports.hpp"
+   #include "shared/switch_pro_protocol.hpp"
++  #include "usbip/dualsense_device.hpp"
++  #include "usbip/haptics_rtp.hpp"
++  #include "usbip/usbip_protocol.hpp"
++  #include "usbip/usbip_session.hpp"
++  #include "usbip/vhci.hpp"
+ #endif
+ 
+ #include <libvirtualhid/profiles.hpp>
+@@ -3648,6 +3656,581 @@ namespace lvh::detail {
+     };
+ #endif
+ 
++#if defined(__linux__)
++    constexpr auto dualsense_usbip_env = "LIBVIRTUALHID_DUALSENSE_USBIP";
++    constexpr auto vhci_sysfs_env = "LIBVIRTUALHID_VHCI_SYSFS";
++    constexpr auto dualsense_haptics_rtp_env = "LIBVIRTUALHID_DUALSENSE_HAPTICS_RTP";
++    constexpr auto dualsense_haptics_gain_env = "LIBVIRTUALHID_DUALSENSE_HAPTICS_GAIN";
++    constexpr auto dualsense_haptics_gain_file_env = "LIBVIRTUALHID_DUALSENSE_HAPTICS_GAIN_FILE";
++    constexpr int usbip_attach_attempts = 3;
++    constexpr auto usbip_enumeration_timeout = std::chrono::seconds {2};
++    constexpr auto usbip_enumeration_poll_interval = std::chrono::milliseconds {10};
++    constexpr std::size_t usbip_output_queue_capacity = 256;
++    // Bus 1, device 1: the identifier vhci-hcd reports for the imported device.
++    constexpr std::uint32_t usbip_device_id = (1U << 16U) | 1U;
++
++    std::optional<std::string> environment_string(const char *name) {
++      const auto *value = std::getenv(name);
++      if (value == nullptr) {
++        return std::nullopt;
++      }
++      return std::string {value};
++    }
++
++    bool environment_equals(const char *name, std::string_view expected) {
++      const auto value = environment_string(name);
++      return value.has_value() && *value == expected;
++    }
++
++    std::optional<float> parse_float(const std::string &text) {
++      char *end = nullptr;
++      const auto value = std::strtof(text.c_str(), &end);
++      if (end == text.c_str() || *end != '\0' || !std::isfinite(value)) {
++        return std::nullopt;
++      }
++      return value;
++    }
++
++    /**
++     * @brief Write one line to the USB/IP library log, prefixed like every libvirtualhid diagnostic.
++     *
++     * @param message Message without trailing newline.
++     */
++    void usbip_log(std::string_view message) {
++      std::fprintf(stderr, "libvirtualhid: %.*s\n", static_cast<int>(message.size()), message.data());
++    }
++
++    /**
++     * @brief Read a whole small text file through the syscall wrappers.
++     *
++     * @param path File to read, such as the vhci-hcd status file.
++     * @return File content, or std::nullopt when it cannot be opened or read.
++     */
++    std::optional<std::string> read_text_file(const std::string &path) {
++      const auto fd = system_open(path.c_str(), O_RDONLY | O_CLOEXEC);
++      if (fd < 0) {
++        return std::nullopt;
++      }
++
++      std::string text;
++      std::array<std::byte, 256> buffer {};
++      while (true) {
++        const auto count = system_read(fd, buffer);
++        if (count == 0) {
++          break;
++        }
++        if (count < 0) {
++          if (errno == EINTR) {
++            continue;
++          }
++          static_cast<void>(system_close(fd));
++          return std::nullopt;
++        }
++        text.append(reinterpret_cast<const char *>(buffer.data()), static_cast<std::size_t>(count));
++      }
++      static_cast<void>(system_close(fd));
++      return text;
++    }
++
++    /**
++     * @brief Write a short text to a vhci-hcd control file ("attach" or "detach").
++     *
++     * @param path Control file to write.
++     * @param text Text to write, without trailing newline.
++     * @return 0 on success, otherwise the errno of the failing call.
++     */
++    int write_control_file(const std::string &path, const std::string &text) {
++      const auto fd = system_open(path.c_str(), O_WRONLY | O_CLOEXEC);
++      if (fd < 0) {
++        return errno;
++      }
++      const auto written = system_write(fd, std::as_bytes(std::span<const char> {text}));
++      const auto error = written == static_cast<std::ptrdiff_t>(text.size()) ? 0 : (written < 0 ? errno : EIO);
++      static_cast<void>(system_close(fd));
++      return error;
++    }
++
++    std::vector<std::string> directory_entry_names(const std::filesystem::path &directory) {
++      std::vector<std::string> names;
++      std::error_code error;
++      for (std::filesystem::directory_iterator it {directory, error}, end; !error && it != end; it.increment(error)) {
++        names.push_back(it->path().filename().string());
++      }
++      return names;
++    }
++
++    /**
++     * @brief Append the sysfs, hidraw and evdev/joystick nodes below one HID device directory.
++     *
++     * @param nodes Output list.
++     * @param hid_directory Directory named like 0003:054C:0CE6.NNNN.
++     */
++    void append_usbip_hid_nodes(std::vector<DeviceNode> &nodes, const std::filesystem::path &hid_directory) {
++      using enum DeviceNodeKind;
++
++      append_node(nodes, sysfs, hid_directory);
++      for (const auto &name : directory_entry_names(hid_directory / "hidraw")) {
++        if (name.starts_with("hidraw")) {
++          append_node(nodes, hidraw, std::filesystem::path {"/dev"} / name);
++        }
++      }
++      for (const auto &input : directory_entry_names(hid_directory / "input")) {
++        if (!input.starts_with("input")) {
++          continue;
++        }
++        for (const auto &name : directory_entry_names(hid_directory / "input" / input)) {
++          if (name.starts_with("event")) {
++            append_node(nodes, input_event, std::filesystem::path {"/dev/input"} / name);
++          } else if (name.starts_with("js")) {
++            append_node(nodes, joystick, std::filesystem::path {"/dev/input"} / name);
++          }
++        }
++      }
++    }
++
++    /**
++     * @brief Find the platform nodes of the DualSense attached at one vhci port.
++     *
++     * The device sits in the first high-speed root hub usbN as N-<port+1>, with its HID interface
++     * N-<port+1>:1.3 holding the 0003:* HID device directory.
++     *
++     * @param sysfs_root vhci-hcd sysfs directory.
++     * @param port vhci port number (0-based, as in the status file).
++     * @return Discovered nodes, or an empty list when nothing matches.
++     */
++    std::vector<DeviceNode> usbip_device_nodes(const std::filesystem::path &sysfs_root, int port) {
++      std::vector<DeviceNode> nodes;
++      for (const auto &name : directory_entry_names(sysfs_root)) {
++        if (!name.starts_with("usb")) {
++          continue;
++        }
++        const auto bus = name.substr(3);
++        if (bus.empty() || !std::ranges::all_of(bus, [](char digit) {
++              return digit >= '0' && digit <= '9';
++            })) {
++          continue;
++        }
++        if (read_first_line(sysfs_root / name / "speed") != std::string {"480"}) {
++          continue;
++        }
++
++        const auto interface_directory = sysfs_root / name / std::format("{}-{}", bus, port + 1) /
++                                         std::format("{}-{}:1.3", bus, port + 1);
++        for (const auto &hid_name : directory_entry_names(interface_directory)) {
++          if (hid_name.starts_with("0003:")) {
++            append_usbip_hid_nodes(nodes, interface_directory / hid_name);
++          }
++        }
++        return nodes;
++      }
++      return nodes;
++    }
++
++    /**
++     * @brief DualSense emulated over USB/IP and attached to the vhci-hcd kernel driver.
++     *
++     * A DualSenseDevice answers the requests of a UsbipSession whose socket is handed to vhci-hcd.
++     * Output reports are queued from the session threads and dispatched by one worker thread, so
++     * the output callback never runs on a session thread.
++     */
++    class UsbipGamepad final: public BackendGamepad {
++    public:
++      /**
++       * @brief Create an unattached gamepad for the USB DualSense profile.
++       *
++       * @param profile USB DualSense profile.
++       * @param mac Controller MAC address used by the pairing feature report.
++       */
++      UsbipGamepad(DeviceProfile profile, const std::array<std::uint8_t, 6> &mac):
++          profile_ {std::move(profile)},
++          playstation_mac_address_ {mac} {
++        last_report_[0] = ds5usbip::dualsense::kInputReportId;
++      }
++
++      UsbipGamepad(const UsbipGamepad &) = delete;
++      UsbipGamepad &operator=(const UsbipGamepad &) = delete;
++      UsbipGamepad(UsbipGamepad &&) noexcept = delete;
++      UsbipGamepad &operator=(UsbipGamepad &&) noexcept = delete;
++
++      /**
++       * @brief Destroy the gamepad, detaching it from vhci-hcd when it is attached.
++       */
++      ~UsbipGamepad() override {
++        static_cast<void>(close());
++      }
++
++      /**
++       * @brief Create the emulated DualSense and attach it to vhci-hcd.
++       *
++       * Every resource acquired before a failure is released, so the caller may fall back to uhid.
++       *
++       * @param id Runtime-assigned device id, used for the MAC address when stable_id is not a MAC.
++       * @param options Creation options; the profile must be the USB DualSense profile.
++       * @return Creation result. On failure, the status message is the reason for the fallback.
++       */
++      static BackendGamepadCreationResult create(DeviceId id, const CreateGamepadOptions &options) {
++        const auto sysfs_root = environment_string(vhci_sysfs_env).value_or(std::string {ds5usbip::vhci::kDefaultSysfs});
++        if (system_access((sysfs_root + "/attach").c_str(), W_OK) != 0) {
++          return {
++            OperationStatus::failure(ErrorCode::backend_unavailable, "vhci-hcd not loaded or attach not writable"),
++            nullptr,
++          };
++        }
++
++        const auto mac = parse_mac_address(options.metadata.stable_id).value_or(generated_mac_address(id));
++        auto gamepad = std::make_unique<UsbipGamepad>(options.profile, mac);
++        if (auto status = gamepad->start(sysfs_root); !status.ok()) {
++          static_cast<void>(gamepad->close());
++          return {std::move(status), nullptr};
++        }
++        return {OperationStatus::success(), std::move(gamepad)};
++      }
++
++      /**
++       * @brief Store the latest state and its packed report for the next USB IN polls.
++       *
++       * @param state Normalized gamepad state.
++       * @param report Packed 64-byte DualSense USB input report.
++       * @return Submit status.
++       */
++      OperationStatus submit(const GamepadState &state, const std::vector<std::uint8_t> &report) override {
++        using enum ErrorCode;
++
++        if (!open_) {
++          return OperationStatus::failure(device_closed, "USB/IP gamepad is closed");
++        }
++        if (peer_closed_) {
++          return OperationStatus::failure(device_closed, "vhci-hcd closed the USB/IP connection");
++        }
++        if (report.size() != ds5usbip::dualsense::kHidReportSize) {
++          return OperationStatus::failure(invalid_argument, "DualSense USB input report must be 64 bytes");
++        }
++
++        ds5usbip::DualSenseDevice::Report stored {};
++        std::copy(report.begin(), report.end(), stored.begin());
++        {
++          std::lock_guard lock {state_mutex_};
++          last_state_ = state;
++          last_report_ = stored;
++        }
++        device_->set_input_report(stored);
++        return OperationStatus::success();
++      }
++
++      /**
++       * @brief Register the callback that receives parsed output reports on the dispatcher thread.
++       *
++       * @param callback Output callback; an empty callback drops the outputs.
++       */
++      void set_output_callback(OutputCallback callback) override {
++        std::lock_guard lock {callback_mutex_};
++        output_callback_ = std::move(callback);
++      }
++
++      /**
++       * @brief Platform nodes of the attached DualSense, read from the vhci-hcd sysfs tree.
++       *
++       * @return Discovered nodes, or an empty list when the device is not attached or not yet visible.
++       */
++      std::vector<DeviceNode> device_nodes() const override {
++        if (!attached_port_) {
++          return {};
++        }
++        return usbip_device_nodes(sysfs_root_, *attached_port_);
++      }
++
++      /**
++       * @brief Detach from vhci-hcd, stop the USB/IP session and the output dispatcher.
++       *
++       * The detach write is best effort: closing the session also unplugs the device. Calling close()
++       * again has no effect.
++       *
++       * @return Close status.
++       */
++      OperationStatus close() override {
++        if (!open_.exchange(false)) {
++          return OperationStatus::success();
++        }
++
++        if (attached_port_) {
++          static_cast<void>(write_control_file(sysfs_root_ + "/detach", std::to_string(*attached_port_)));
++          attached_port_.reset();
++        }
++        if (session_) {
++          session_->stop();
++        }
++
++        std::size_t dropped = 0;
++        {
++          std::lock_guard lock {queue_mutex_};
++          output_queue_.clear();
++          dropped = std::exchange(dropped_output_reports_, 0);
++        }
++        if (dispatcher_.joinable()) {
++          dispatcher_.request_stop();
++          dispatcher_.join();
++        }
++        if (dropped != 0) {
++          usbip_log(std::format("dropped {} DualSense output reports while the queue was full", dropped));
++        }
++        haptics_.reset();
++        return OperationStatus::success();
++      }
++
++    private:
++      /**
++       * @brief Build the device, open the session, attach it and wait for enumeration.
++       *
++       * @param sysfs_root vhci-hcd sysfs directory.
++       * @return Start status; on failure the caller closes the gamepad.
++       */
++      OperationStatus start(std::string sysfs_root) {
++        sysfs_root_ = std::move(sysfs_root);
++
++        std::array<int, 2> pair {-1, -1};
++        if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair.data()) != 0) {
++          return system_error_status(ErrorCode::backend_failure, "socketpair failed", errno);
++        }
++
++        device_ = std::make_unique<ds5usbip::DualSenseDevice>(make_device_config(), make_device_callbacks());
++        configure_haptics();
++
++        ds5usbip::UsbipSession::Callbacks callbacks;
++        callbacks.audio_out = [this](std::span<const std::uint8_t> pcm) {
++          if (haptics_) {
++            haptics_->send(pcm);
++          }
++        };
++        callbacks.closed = [this] {
++          peer_closed_ = true;
++        };
++        session_ = std::make_unique<ds5usbip::UsbipSession>(pair[0], *device_, std::move(callbacks), usbip_log);
++        if (!session_->start()) {
++          static_cast<void>(system_close(pair[1]));
++          return OperationStatus::failure(ErrorCode::backend_failure, "failed to start the USB/IP session");
++        }
++
++        const auto attach_status = attach(pair[1]);
++        static_cast<void>(system_close(pair[1]));  // vhci-hcd keeps its own reference
++        if (!attach_status.ok()) {
++          return attach_status;
++        }
++
++        if (const auto status = wait_for_enumeration(); !status.ok()) {
++          return status;
++        }
++
++        dispatcher_ = std::jthread {[this](std::stop_token stop_token) {
++          dispatch_loop(stop_token);
++        }};
++        return OperationStatus::success();
++      }
++
++      /**
++       * @brief Write the attach line on a free high-speed port, retrying when the port is busy.
++       *
++       * @param kernel_fd Kernel side of the socketpair; vhci-hcd takes its own reference.
++       * @return Attach status; the attached port is remembered on success.
++       */
++      OperationStatus attach(int kernel_fd) {
++        const auto status_path = sysfs_root_ + "/status";
++        const auto attach_path = sysfs_root_ + "/attach";
++        std::vector<int> busy_ports;
++        for (int attempt = 0; attempt < usbip_attach_attempts; ++attempt) {
++          const auto status_text = read_text_file(status_path);
++          if (!status_text) {
++            return OperationStatus::failure(ErrorCode::backend_unavailable, "vhci-hcd status is unreadable");
++          }
++
++          const auto port = ds5usbip::vhci::pick_free_port(ds5usbip::vhci::parse_status(*status_text), busy_ports);
++          if (!port) {
++            return OperationStatus::failure(ErrorCode::backend_unavailable, "no free high-speed vhci port");
++          }
++
++          const auto line = ds5usbip::vhci::attach_line(
++            *port,
++            kernel_fd,
++            usbip_device_id,
++            static_cast<int>(ds5usbip::usbip::kSpeedHigh)
++          );
++          const auto error = write_control_file(attach_path, line);
++          if (error == 0) {
++            attached_port_ = *port;
++            return OperationStatus::success();
++          }
++          if (error != EBUSY) {
++            return system_error_status(ErrorCode::backend_failure, "attach write failed", error);
++          }
++          busy_ports.push_back(*port);
++        }
++        return OperationStatus::failure(ErrorCode::backend_unavailable, "vhci-hcd ports stayed busy");
++      }
++
++      /**
++       * @brief Poll until the host has set the configuration of the emulated device.
++       *
++       * @return Success once configured; failure on timeout or when the peer closed the connection.
++       */
++      OperationStatus wait_for_enumeration() {
++        const auto deadline = std::chrono::steady_clock::now() + usbip_enumeration_timeout;
++        while (!device_->configured()) {
++          if (peer_closed_) {
++            return OperationStatus::failure(ErrorCode::backend_failure, "vhci-hcd closed the connection before enumeration");
++          }
++          if (std::chrono::steady_clock::now() >= deadline) {
++            return OperationStatus::failure(ErrorCode::backend_failure, "enumeration timeout");
++          }
++          std::this_thread::sleep_for(usbip_enumeration_poll_interval);
++        }
++        return OperationStatus::success();
++      }
++
++      /**
++       * @brief Create the RTP haptics sender when LIBVIRTUALHID_DUALSENSE_HAPTICS_RTP is set.
++       */
++      void configure_haptics() {
++        const auto destination = environment_string(dualsense_haptics_rtp_env);
++        if (!destination) {
++          return;
++        }
++
++        auto sender = std::make_unique<ds5usbip::HapticsRtpSender>(usbip_log);
++        if (!sender->set_destination(*destination)) {
++          usbip_log(std::format("haptics disabled, invalid destination {}", *destination));
++          return;
++        }
++
++        auto gain = 1.0F;
++        if (const auto gain_text = environment_string(dualsense_haptics_gain_env)) {
++          if (const auto parsed = parse_float(*gain_text)) {
++            gain = *parsed;
++          } else {
++            usbip_log(std::format("invalid haptics gain {}, using 1", *gain_text));
++          }
++        }
++        sender->set_gain(gain, environment_string(dualsense_haptics_gain_file_env).value_or(std::string {}));
++        haptics_ = std::move(sender);
++      }
++
++      ds5usbip::DeviceConfig make_device_config() {
++        ds5usbip::DeviceConfig config;
++        config.hid_report_descriptor = std::span<const std::uint8_t> {profile_.report_descriptor};
++        config.get_feature = [profile = profile_, mac = playstation_mac_address_](std::uint8_t report_number) {
++          return playstation_feature_report(profile, mac, report_number);
++        };
++        config.input_provider = [this] {
++          return current_input_report();
++        };
++        return config;
++      }
++
++      ds5usbip::DualSenseDevice::Callbacks make_device_callbacks() {
++        ds5usbip::DualSenseDevice::Callbacks callbacks;
++        // SET_REPORT(feature) data already starts with its report id, so it is queued as is,
++        // as uhid's dispatch_set_report does for the same bytes.
++        callbacks.output_report = [this](std::span<const std::uint8_t> report) {
++          enqueue_output(report);
++        };
++        callbacks.feature_set = [this](std::span<const std::uint8_t> report) {
++          enqueue_output(report);
++        };
++        return callbacks;
++      }
++
++      /**
++       * @brief Input report for one HID IN poll, packed from the latest state.
++       *
++       * DualSense reports carry a sequence number and a timestamp, so the report is packed on every poll.
++       * When the packed size is unexpected, the last submitted report is returned.
++       *
++       * @return 64-byte input report.
++       */
++      ds5usbip::DualSenseDevice::Report current_input_report() {
++        GamepadState state;
++        ds5usbip::DualSenseDevice::Report report {};
++        {
++          std::lock_guard lock {state_mutex_};
++          state = last_state_;
++          report = last_report_;
++        }
++
++        const auto packed = reports::pack_input_report(profile_, state);
++        if (packed.size() == report.size()) {
++          std::copy(packed.begin(), packed.end(), report.begin());
++        }
++        return report;
++      }
++
++      /**
++       * @brief Queue one output report, dropping the oldest one when the queue is full.
++       *
++       * @param report Raw report bytes, report id first.
++       */
++      void enqueue_output(std::span<const std::uint8_t> report) {
++        std::lock_guard lock {queue_mutex_};
++        if (output_queue_.size() >= usbip_output_queue_capacity) {
++          output_queue_.pop_front();
++          ++dropped_output_reports_;
++        }
++        output_queue_.emplace_back(report.begin(), report.end());
++        queue_condition_.notify_one();
++      }
++
++      /**
++       * @brief Pop queued output reports in FIFO order and dispatch them until stop is requested.
++       *
++       * @param stop_token Stop request from close().
++       */
++      void dispatch_loop(std::stop_token stop_token) {
++        std::unique_lock lock {queue_mutex_};
++        while (queue_condition_.wait(lock, stop_token, [this] {
++          return !output_queue_.empty();
++        })) {
++          auto report = std::move(output_queue_.front());
++          output_queue_.pop_front();
++          lock.unlock();
++          dispatch_output_report(report);
++          lock.lock();
++        }
++      }
++
++      void dispatch_output_report(const std::vector<std::uint8_t> &report) {
++        OutputCallback callback;
++        {
++          std::lock_guard lock {callback_mutex_};
++          callback = output_callback_;
++        }
++        if (!callback) {
++          return;
++        }
++
++        for (const auto &output : reports::parse_output_reports(profile_, report)) {
++          callback(output);
++        }
++      }
++
++      DeviceProfile profile_;
++      std::array<std::uint8_t, 6> playstation_mac_address_ {};
++      std::string sysfs_root_;
++      std::optional<int> attached_port_;
++      std::atomic_bool open_ = true;
++      std::atomic_bool peer_closed_ = false;
++      std::mutex state_mutex_;
++      GamepadState last_state_;
++      ds5usbip::DualSenseDevice::Report last_report_ {};
++      std::mutex callback_mutex_;
++      OutputCallback output_callback_;
++      std::mutex queue_mutex_;
++      std::condition_variable_any queue_condition_;
++      std::deque<std::vector<std::uint8_t>> output_queue_;
++      std::size_t dropped_output_reports_ = 0;
++      std::unique_ptr<ds5usbip::HapticsRtpSender> haptics_;
++      std::unique_ptr<ds5usbip::DualSenseDevice> device_;
++      std::unique_ptr<ds5usbip::UsbipSession> session_;
++      std::jthread dispatcher_;
++    };
++#endif
++
+     std::optional<DeviceProfile> effective_uinput_profile(const DeviceProfile &requested_profile) {
+       auto effective_profile = requested_profile;
+ #if defined(__FreeBSD__)
+@@ -3701,6 +4284,22 @@ namespace lvh::detail {
+ 
+       BackendGamepadCreationResult create_gamepad(DeviceId id, const CreateGamepadOptions &options) override {
+ #if defined(__linux__)
++        if (
++          options.profile.gamepad_kind == GamepadProfileKind::dualsense &&
++          options.profile.bus_type == BusType::usb &&
++          environment_equals(dualsense_usbip_env, "1")
++        ) {
++          auto usbip_result = UsbipGamepad::create(id, options);
++          if (usbip_result.status.ok()) {
++            return usbip_result;
++          }
++          std::fprintf(
++            stderr,
++            "libvirtualhid: DualSense USB/IP unavailable (%s), using uhid\n",
++            usbip_result.status.message().c_str()
++          );
++        }
++
+         if (prefers_uhid_gamepad_profile(options.profile.gamepad_kind)) {
+           const auto fd = system_open(uhid_path, O_RDWR | O_CLOEXEC | O_NONBLOCK);
+           if (fd >= 0) {
+diff --git a/tests/fixtures/include/fixtures/linux_backend_test_hooks.hpp b/tests/fixtures/include/fixtures/linux_backend_test_hooks.hpp
+index 6f1ad16..5356fe8 100644
+--- a/tests/fixtures/include/fixtures/linux_backend_test_hooks.hpp
++++ b/tests/fixtures/include/fixtures/linux_backend_test_hooks.hpp
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ // standard includes
++#include <array>
+ #include <cstddef>
+ #include <cstdint>
+ #include <optional>
+@@ -1114,6 +1115,65 @@ namespace lvh::detail::test {
+    */
+   LinuxUhidRoundTripResult linux_dualsense_uhid_socketpair_reports();
+ 
++  /**
++   * @brief Scenario in which UsbipGamepad creation falls back to uhid.
++   */
++  enum class LinuxUsbipFallbackCase {
++    env_unset,  ///< LIBVIRTUALHID_DUALSENSE_USBIP is unset: uhid is chosen without touching vhci-hcd.
++    attach_missing,  ///< The vhci-hcd attach file does not exist.
++    no_free_port,  ///< Every high-speed port in the status file is in use.
++    attach_busy,  ///< Every attach write fails with EBUSY.
++    enumeration_timeout,  ///< The host never sets the configuration.
++  };
++
++  /**
++   * @brief Observable outcome of one UsbipGamepad fallback scenario.
++   */
++  struct LinuxUsbipFallbackResult {
++    OperationStatus create_status;  ///< Status returned by create_gamepad after the fallback.
++    int attach_write_count = 0;  ///< Attach writes seen by the write hook.
++    bool peer_saw_eof = false;  ///< The vhci side read end-of-stream after the session stopped.
++    std::string detach_text;  ///< Text written to the detach file, empty when none was written.
++  };
++
++  /**
++   * @brief Observable outcome of the USB/IP DualSense happy path.
++   */
++  struct LinuxUsbipRoundTripResult {
++    OperationStatus create_status;  ///< Status of create_gamepad with the USB/IP backend selected.
++    OperationStatus submit_status;  ///< Status of submit().
++    OperationStatus close_status;  ///< Status of close().
++    int attach_write_count = 0;  ///< Attach writes seen by the write hook.
++    int attached_port = -1;  ///< Port named in the attach line.
++    std::uint32_t attached_devid = 0;  ///< Device id named in the attach line.
++    int attached_speed = -1;  ///< Speed named in the attach line (3 = high speed).
++    std::uint16_t hid_descriptor_length = 0;  ///< wDescriptorLength of the HID descriptor in the configuration.
++    bool configuration_set = false;  ///< SET_CONFIGURATION 1 was answered with success.
++    std::array<std::uint8_t, 7> pairing_prefix {};  ///< Feature report 0x09 bytes 0-6 (id, then reversed MAC).
++    bool input_report_matches = false;  ///< Interrupt IN report equals the packed state, ignoring sequence and timestamp.
++    std::size_t burst_sent = 0;  ///< Interrupt OUT reports acknowledged by the peer.
++    std::size_t burst_count = 0;  ///< Rumble outputs received by the output callback.
++    bool burst_in_order = false;  ///< Rumble outputs arrived once each, in the order sent.
++    bool burst_on_caller_thread = false;  ///< Some output callback ran on the thread that drove the peer.
++    bool peer_saw_eof_after_close = false;  ///< The vhci side read end-of-stream after close().
++    std::string detach_text;  ///< Text written to the detach file by close().
++  };
++
++  /**
++   * @brief Run one UsbipGamepad fallback scenario through LinuxUhidBackend::create_gamepad.
++   *
++   * @param fallback_case Scenario to run.
++   * @return Observed fallback outcome.
++   */
++  LinuxUsbipFallbackResult linux_usbip_gamepad_fallback(LinuxUsbipFallbackCase fallback_case);
++
++  /**
++   * @brief Run the USB/IP DualSense happy path: attach, enumerate, input, output burst, feature report, close.
++   *
++   * @return Observed round-trip outcome.
++   */
++  LinuxUsbipRoundTripResult linux_usbip_gamepad_round_trip();
++
+   /**
+    * @brief Exercise Bluetooth DualSense UHID framing and signed feature replies over a socketpair.
+    *
+diff --git a/tests/fixtures/linux_backend_test_hooks.cpp b/tests/fixtures/linux_backend_test_hooks.cpp
+index ee5fe61..75c923c 100644
+--- a/tests/fixtures/linux_backend_test_hooks.cpp
++++ b/tests/fixtures/linux_backend_test_hooks.cpp
+@@ -11,17 +11,23 @@
+ #include <cerrno>
+ #include <chrono>
+ #include <cmath>
++#include <condition_variable>
+ #include <cstddef>
+ #include <cstdint>
++#include <cstdlib>
+ #include <cstring>
+ #include <filesystem>
++#include <format>
+ #include <fstream>
++#include <functional>
+ #include <iomanip>
++#include <iterator>
+ #include <map>
+ #include <memory>
+ #include <mutex>
+ #include <numbers>
+ #include <optional>
++#include <random>
+ #include <span>
+ #include <sstream>
+ #include <string>
+@@ -62,6 +68,12 @@
+ // local includes
+ #include "fixtures/linux_backend_test_hooks.hpp"
+ 
++#if defined(__linux__)
++  #include "../../src/platform/linux/usbip/usbip_protocol.hpp"
++
++  #include <sys/time.h>
++#endif
++
+ #if defined(__linux__)
+ namespace lvh::detail::test {
+   namespace {
+@@ -161,6 +173,9 @@ namespace lvh::detail::test {
+       std::vector<std::unique_ptr<FakeLibevdevUinput>> owned_libevdev_uinput_devices;
+       std::vector<FakeLibevdevDevice> libevdev_devices;
+       std::size_t libevdev_destroy_count = 0;
++      // Optional interceptors: a value returned here replaces the syscall, std::nullopt runs it.
++      std::function<std::optional<int>(const char *path, int flags)> open_interceptor;
++      std::function<std::optional<std::ptrdiff_t>(int fd, const std::byte *buffer, std::size_t size)> write_interceptor;
+     };
+ 
+     LinuxTestSyscalls *&active_test_syscalls() {
+@@ -211,6 +226,11 @@ int lvh_linux_test_access(const char *path, int mode) {
+ int lvh_linux_test_open(const char *path, int flags) {
+   if (lvh::detail::test::active_test_syscalls() != nullptr) {
+     lvh::detail::test::active_test_syscalls()->last_open_flags = flags;
++    if (lvh::detail::test::active_test_syscalls()->open_interceptor) {
++      if (const auto result = lvh::detail::test::active_test_syscalls()->open_interceptor(path, flags)) {
++        return *result;
++      }
++    }
+   }
+   if (lvh::detail::test::active_test_syscalls() != nullptr && lvh::detail::test::active_test_syscalls()->override_open) {
+     if (lvh::detail::test::active_test_syscalls()->open_result < 0) {
+@@ -227,6 +247,11 @@ int lvh_linux_test_open(const char *path, int flags) {
+ }
+ 
+ std::ptrdiff_t lvh_linux_test_write(int fd, const std::byte *buffer, std::size_t size) {
++  if (lvh::detail::test::active_test_syscalls() != nullptr && lvh::detail::test::active_test_syscalls()->write_interceptor) {
++    if (const auto result = lvh::detail::test::active_test_syscalls()->write_interceptor(fd, buffer, size)) {
++      return *result;
++    }
++  }
+   if (lvh::detail::test::active_test_syscalls() != nullptr && lvh::detail::test::active_test_syscalls()->override_write) {
+     const auto call_count = ++lvh::detail::test::active_test_syscalls()->write_call_count;
+     if (lvh::detail::test::active_test_syscalls()->fail_write_call == call_count) {
+@@ -2033,6 +2058,441 @@ namespace lvh::detail::test {
+     return result;
+   }
+ 
++  namespace {
++
++    constexpr std::uint32_t usbip_test_devid = (1U << 16U) | 1U;
++    constexpr std::string_view usbip_status_header = "hub port sta spd dev      sockfd local_busid\n";
++    constexpr std::string_view usbip_status_port0_busy = "hs  0000 006 003 00010001 000003 3-1\n";
++
++    std::string usbip_status_text(LinuxUsbipFallbackCase fallback_case) {
++      std::string text {usbip_status_header};
++      if (fallback_case == LinuxUsbipFallbackCase::no_free_port) {
++        text += "hs  0000 006 003 00010001 000003 3-1\nhs  0001 006 003 00010001 000004 3-2\n";
++      } else if (fallback_case == LinuxUsbipFallbackCase::attach_busy) {
++        text += std::string {usbip_status_port0_busy};
++        text += "hs  0001 004 000 00000000 000000 0-0\nhs  0002 004 000 00000000 000000 0-0\nhs  0003 004 000 00000000 000000 0-0\n";
++      } else {
++        text += std::string {usbip_status_port0_busy};
++        text += "hs  0001 004 000 00000000 000000 0-0\n";
++      }
++      return text;
++    }
++
++    std::string fd_path(int fd) {
++      std::array<char, 512> buffer {};
++      const auto link = std::format("/proc/self/fd/{}", fd);
++      const auto count = ::readlink(link.c_str(), buffer.data(), buffer.size() - 1);
++      if (count < 0) {
++        return {};
++      }
++      return std::string {buffer.data(), static_cast<std::size_t>(count)};
++    }
++
++    /**
++     * @brief Fake vhci-hcd sysfs directory, removed with its environment.
++     */
++    class ScopedVhciSysfs {
++    public:
++      ScopedVhciSysfs(const std::string &status_text, bool with_attach_file):
++          root_ {std::filesystem::temp_directory_path() / std::format("lvh-vhci-{}-{}", ::getpid(), std::random_device {}())} {
++        std::filesystem::create_directories(root_);
++        {
++          std::ofstream status {root_ / "status"};
++          status << status_text;
++        }
++        if (with_attach_file) {
++          std::ofstream attach {root_ / "attach"};
++        }
++        std::ofstream detach {root_ / "detach"};
++      }
++
++      ScopedVhciSysfs(const ScopedVhciSysfs &) = delete;
++      ScopedVhciSysfs &operator=(const ScopedVhciSysfs &) = delete;
++      ScopedVhciSysfs(ScopedVhciSysfs &&) noexcept = delete;
++      ScopedVhciSysfs &operator=(ScopedVhciSysfs &&) noexcept = delete;
++
++      ~ScopedVhciSysfs() {
++        std::error_code error;
++        std::filesystem::remove_all(root_, error);
++      }
++
++      std::string path() const {
++        return root_.string();
++      }
++
++    private:
++      std::filesystem::path root_;
++    };
++
++    /**
++     * @brief Sets the libvirtualhid environment variables for one scenario.
++     */
++    class ScopedUsbipEnvironment {
++    public:
++      ScopedUsbipEnvironment(const std::string &sysfs_root, bool enable_usbip) {
++        static_cast<void>(::setenv("LIBVIRTUALHID_VHCI_SYSFS", sysfs_root.c_str(), 1));
++        if (enable_usbip) {
++          static_cast<void>(::setenv("LIBVIRTUALHID_DUALSENSE_USBIP", "1", 1));
++        } else {
++          static_cast<void>(::unsetenv("LIBVIRTUALHID_DUALSENSE_USBIP"));
++        }
++      }
++
++      ScopedUsbipEnvironment(const ScopedUsbipEnvironment &) = delete;
++      ScopedUsbipEnvironment &operator=(const ScopedUsbipEnvironment &) = delete;
++      ScopedUsbipEnvironment(ScopedUsbipEnvironment &&) noexcept = delete;
++      ScopedUsbipEnvironment &operator=(ScopedUsbipEnvironment &&) noexcept = delete;
++
++      ~ScopedUsbipEnvironment() {
++        static_cast<void>(::unsetenv("LIBVIRTUALHID_VHCI_SYSFS"));
++        static_cast<void>(::unsetenv("LIBVIRTUALHID_DUALSENSE_USBIP"));
++      }
++    };
++
++    /**
++     * @brief Attach-side state recorded by the write hook. The hook runs on the thread calling create_gamepad.
++     */
++    struct UsbipAttachProbe {
++      std::mutex mutex;
++      std::condition_variable condition;
++      int attach_write_count = 0;
++      bool attached = false;
++      bool busy_mode = false;
++      int attached_port = -1;
++      std::uint32_t attached_devid = 0;
++      int attached_speed = -1;
++      int peer_fd = -1;
++      std::string detach_text;
++
++      ~UsbipAttachProbe() {
++        if (peer_fd >= 0) {
++          static_cast<void>(::close(peer_fd));
++        }
++      }
++    };
++
++    void install_usbip_hooks(LinuxTestSyscalls &syscalls, UsbipAttachProbe &probe) {
++      syscalls.open_interceptor = [](const char *path, int) -> std::optional<int> {
++        if (std::string_view {path} == "/dev/uhid") {
++          errno = ENOENT;
++          return -1;
++        }
++        return std::nullopt;
++      };
++      syscalls.write_interceptor = [&probe](int fd, const std::byte *buffer, std::size_t size) -> std::optional<std::ptrdiff_t> {
++        const auto path = fd_path(fd);
++        const auto text = std::string {reinterpret_cast<const char *>(buffer), size};
++        if (path.ends_with("/detach")) {
++          std::lock_guard lock {probe.mutex};
++          probe.detach_text = text;
++          return static_cast<std::ptrdiff_t>(size);
++        }
++        if (!path.ends_with("/attach")) {
++          return std::nullopt;
++        }
++
++        std::lock_guard lock {probe.mutex};
++        ++probe.attach_write_count;
++        if (probe.busy_mode) {
++          errno = EBUSY;
++          return -1;
++        }
++        int port = -1;
++        int kernel_fd = -1;
++        std::uint32_t devid = 0;
++        int speed = -1;
++        std::istringstream line {text};
++        line >> port >> kernel_fd >> devid >> speed;
++        if (!line) {
++          errno = EINVAL;
++          return -1;
++        }
++        probe.peer_fd = ::dup(kernel_fd);
++        probe.attached = true;
++        probe.attached_port = port;
++        probe.attached_devid = devid;
++        probe.attached_speed = speed;
++        probe.condition.notify_all();
++        return static_cast<std::ptrdiff_t>(size);
++      };
++    }
++
++    bool wait_for_attach(UsbipAttachProbe &probe) {
++      std::unique_lock lock {probe.mutex};
++      return probe.condition.wait_for(lock, std::chrono::seconds {5}, [&probe] {
++        return probe.attached;
++      });
++    }
++
++    bool peer_send_all(int fd, const void *buffer, std::size_t size) {
++      const auto *bytes = static_cast<const std::uint8_t *>(buffer);
++      while (size > 0) {
++        const auto sent = ::send(fd, bytes, size, MSG_NOSIGNAL);
++        if (sent < 0 && errno == EINTR) {
++          continue;
++        }
++        if (sent <= 0) {
++          return false;
++        }
++        bytes += sent;
++        size -= static_cast<std::size_t>(sent);
++      }
++      return true;
++    }
++
++    bool peer_recv_exact(int fd, void *buffer, std::size_t size) {
++      auto *bytes = static_cast<std::uint8_t *>(buffer);
++      while (size > 0) {
++        const auto received = ::recv(fd, bytes, size, 0);
++        if (received < 0 && errno == EINTR) {
++          continue;
++        }
++        if (received <= 0) {
++          return false;
++        }
++        bytes += received;
++        size -= static_cast<std::size_t>(received);
++      }
++      return true;
++    }
++
++    struct UsbipPeerReply {
++      bool ok = false;
++      std::int32_t status = -1;
++      std::vector<std::uint8_t> data;
++    };
++
++    /**
++     * @brief Send one CMD_SUBMIT as the vhci side and wait for its RET_SUBMIT.
++     */
++    UsbipPeerReply peer_transact(
++      int fd,
++      std::uint32_t &seqnum,
++      std::uint32_t direction,
++      std::uint32_t endpoint,
++      const std::array<std::uint8_t, 8> &setup,
++      std::span<const std::uint8_t> out,
++      std::int32_t in_length
++    ) {
++      namespace wire = ds5usbip::usbip;
++      UsbipPeerReply reply;
++
++      wire::Header request {};
++      request.base.command = wire::be32(wire::kCmdSubmit);
++      request.base.seqnum = wire::be32(++seqnum);
++      request.base.devid = wire::be32(usbip_test_devid);
++      request.base.direction = wire::be32(direction);
++      request.base.ep = wire::be32(endpoint);
++      request.u.cmd_submit.transfer_buffer_length = wire::be32s(out.empty() ? in_length : static_cast<std::int32_t>(out.size()));
++      std::memcpy(request.u.cmd_submit.setup, setup.data(), setup.size());
++      if (!peer_send_all(fd, &request, sizeof(request))) {
++        return reply;
++      }
++      if (direction == wire::kDirOut && !out.empty() && !peer_send_all(fd, out.data(), out.size())) {
++        return reply;
++      }
++
++      wire::Header response {};
++      if (!peer_recv_exact(fd, &response, sizeof(response))) {
++        return reply;
++      }
++      if (ntohl(response.base.command) != wire::kRetSubmit || ntohl(response.base.seqnum) != seqnum) {
++        return reply;
++      }
++      reply.status = static_cast<std::int32_t>(ntohl(response.u.ret_submit.status));
++      const auto actual = static_cast<std::int32_t>(ntohl(response.u.ret_submit.actual_length));
++      if (direction == wire::kDirIn && actual > 0) {
++        reply.data.resize(static_cast<std::size_t>(actual));
++        if (!peer_recv_exact(fd, reply.data.data(), reply.data.size())) {
++          return reply;
++        }
++      }
++      reply.ok = true;
++      return reply;
++    }
++
++    bool peer_saw_eof(int fd) {
++      timeval timeout {2, 0};
++      static_cast<void>(::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)));
++      std::array<std::uint8_t, 1> byte {};
++      return ::recv(fd, byte.data(), byte.size(), 0) == 0;
++    }
++
++  }  // namespace
++
++  LinuxUsbipFallbackResult linux_usbip_gamepad_fallback(LinuxUsbipFallbackCase fallback_case) {
++    LinuxUsbipFallbackResult result;
++    UsbipAttachProbe probe;
++    probe.busy_mode = fallback_case == LinuxUsbipFallbackCase::attach_busy;
++    ScopedVhciSysfs sysfs {usbip_status_text(fallback_case), fallback_case != LinuxUsbipFallbackCase::attach_missing};
++    ScopedUsbipEnvironment environment {sysfs.path(), fallback_case != LinuxUsbipFallbackCase::env_unset};
++
++    LinuxTestSyscalls syscalls;
++    install_usbip_hooks(syscalls, probe);
++    ScopedLinuxTestSyscalls scoped_syscalls {syscalls};
++
++    LinuxUhidBackend backend;
++    CreateGamepadOptions options;
++    options.profile = profiles::dualsense_usb();
++    options.metadata.stable_id = "02:03:04:05:06:07";
++    auto created = backend.create_gamepad(1, options);
++    result.create_status = created.status;
++    if (created.gamepad) {
++      static_cast<void>(created.gamepad->close());
++    }
++    created.gamepad.reset();
++
++    {
++      std::lock_guard lock {probe.mutex};
++      result.attach_write_count = probe.attach_write_count;
++      result.detach_text = probe.detach_text;
++    }
++    if (probe.peer_fd >= 0) {
++      result.peer_saw_eof = peer_saw_eof(probe.peer_fd);
++    }
++    return result;
++  }
++
++  LinuxUsbipRoundTripResult linux_usbip_gamepad_round_trip() {
++    namespace wire = ds5usbip::usbip;
++    LinuxUsbipRoundTripResult result;
++    UsbipAttachProbe probe;
++    ScopedVhciSysfs sysfs {std::string {usbip_status_header} + std::string {usbip_status_port0_busy} + "hs  0001 004 000 00000000 000000 0-0\n", true};
++    ScopedUsbipEnvironment environment {sysfs.path(), true};
++
++    LinuxTestSyscalls syscalls;
++    install_usbip_hooks(syscalls, probe);
++    ScopedLinuxTestSyscalls scoped_syscalls {syscalls};
++
++    CreateGamepadOptions options;
++    options.profile = profiles::dualsense_usb();
++    options.metadata.stable_id = "02:03:04:05:06:07";
++
++    BackendGamepadCreationResult created;
++    std::jthread creator {[&created, &options] {
++      LinuxUhidBackend backend;
++      created = backend.create_gamepad(1, options);
++    }};
++
++    if (!wait_for_attach(probe)) {
++      creator.join();
++      result.create_status = created.status;
++      return result;
++    }
++    int peer_fd = -1;
++    {
++      std::lock_guard lock {probe.mutex};
++      peer_fd = probe.peer_fd;
++      result.attach_write_count = probe.attach_write_count;
++      result.attached_port = probe.attached_port;
++      result.attached_devid = probe.attached_devid;
++      result.attached_speed = probe.attached_speed;
++    }
++
++    std::uint32_t seqnum = 0;
++    const auto control_in = [&](std::array<std::uint8_t, 8> setup, std::int32_t length) {
++      return peer_transact(peer_fd, seqnum, wire::kDirIn, 0, setup, {}, length);
++    };
++
++    const auto descriptor = control_in({0x80, 0x06, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02}, 512);
++    // HID descriptor embedded in the configuration descriptor: 09 21 11 01 00 01 22 <wDescriptorLength>.
++    constexpr std::array<std::uint8_t, 7> hid_prefix {0x09, 0x21, 0x11, 0x01, 0x00, 0x01, 0x22};
++    const auto hid = std::search(descriptor.data.begin(), descriptor.data.end(), hid_prefix.begin(), hid_prefix.end());
++    if (hid != descriptor.data.end() && std::distance(hid, descriptor.data.end()) >= 9) {
++      result.hid_descriptor_length = static_cast<std::uint16_t>(hid[7] | (hid[8] << 8U));
++    }
++
++    const auto configured = peer_transact(peer_fd, seqnum, wire::kDirOut, 0, {0x00, 0x09, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00}, {}, 0);
++    result.configuration_set = configured.ok && configured.status == 0;
++    creator.join();
++    result.create_status = created.status;
++    if (!created) {
++      return result;
++    }
++
++    BackendGamepad &gamepad = *created.gamepad;
++    std::mutex records_mutex;
++
++    struct OutputRecord {
++      std::uint16_t low_frequency = 0;
++      std::thread::id thread;
++    };
++
++    std::vector<OutputRecord> records;
++    gamepad.set_output_callback([&records, &records_mutex](const GamepadOutput &output) {
++      if (output.kind == GamepadOutputKind::rumble) {
++        std::lock_guard lock {records_mutex};
++        records.push_back({output.low_frequency_rumble, std::this_thread::get_id()});
++      }
++    });
++
++    const auto pairing = control_in({0xA1, 0x01, 0x09, 0x03, 0x03, 0x00, 0x40, 0x00}, 64);
++    if (pairing.ok && pairing.data.size() >= result.pairing_prefix.size()) {
++      std::copy_n(pairing.data.begin(), result.pairing_prefix.size(), result.pairing_prefix.begin());
++    }
++
++    GamepadState state;
++    state.left_stick.x = 0.5F;
++    const auto expected = reports::pack_input_report(profiles::dualsense_usb(), state);
++    result.submit_status = gamepad.submit(state, expected);
++    const auto input = peer_transact(peer_fd, seqnum, wire::kDirIn, 4, {}, {}, 64);
++    // Masked comparison: the sequence number (byte 7) and the sensor timestamp (bytes 28-31) change per report.
++    result.input_report_matches = input.ok && input.data.size() == expected.size();
++    for (std::size_t index = 0; result.input_report_matches && index < expected.size(); ++index) {
++      const bool masked = index == 7 || (index >= 28 && index <= 31);
++      result.input_report_matches = masked || input.data[index] == expected[index];
++    }
++
++    constexpr std::size_t burst_size = 200;
++    std::size_t burst_sent = 0;
++    for (std::size_t index = 0; index < burst_size; ++index) {
++      std::array<std::uint8_t, 64> output {};
++      output[0] = 0x02;
++      output[1] = 0x01;  // valid_flag0: rumble
++      output[4] = static_cast<std::uint8_t>(index);  // left motor, one step per report
++      const auto reply = peer_transact(peer_fd, seqnum, wire::kDirOut, 3, {}, output, 0);
++      if (!reply.ok || reply.status != 0) {
++        break;
++      }
++      ++burst_sent;
++    }
++    result.burst_sent = burst_sent;
++
++    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds {2};
++    while (true) {
++      {
++        std::lock_guard lock {records_mutex};
++        if (records.size() >= burst_sent || std::chrono::steady_clock::now() >= deadline) {
++          break;
++        }
++      }
++      std::this_thread::sleep_for(std::chrono::milliseconds {1});
++    }
++
++    {
++      std::lock_guard lock {records_mutex};
++      result.burst_count = records.size();
++      result.burst_in_order = records.size() == burst_sent;
++      for (std::size_t index = 0; result.burst_in_order && index < records.size(); ++index) {
++        // Same scaling as the library's output parser: motor byte -> 16-bit rumble.
++        const auto expected_low = static_cast<std::uint16_t>(std::lround((static_cast<float>(index) / 255.0F) * 65535.0F));
++        result.burst_in_order = records[index].low_frequency == expected_low;
++      }
++      result.burst_on_caller_thread = std::ranges::any_of(records, [](const OutputRecord &record) {
++        return record.thread == std::this_thread::get_id();
++      });
++    }
++
++    result.close_status = gamepad.close();
++    result.peer_saw_eof_after_close = peer_saw_eof(peer_fd);
++    created.gamepad.reset();
++    {
++      std::lock_guard lock {probe.mutex};
++      result.detach_text = probe.detach_text;
++    }
++    return result;
++  }
++
+   LinuxUhidRoundTripResult linux_dualsense_uhid_socketpair_reports() {
+     LinuxUhidRoundTripResult result;
+     std::array<int, 2> descriptors {-1, -1};
+diff --git a/tests/unit/test_linux_backend.cpp b/tests/unit/test_linux_backend.cpp
+index ae06648..344a6d8 100644
+--- a/tests/unit/test_linux_backend.cpp
++++ b/tests/unit/test_linux_backend.cpp
+@@ -7,6 +7,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <cstdint>
++#include <cstdio>
+ #include <filesystem>
+ #include <fstream>
+ #include <memory>
+@@ -17,6 +18,7 @@
+ // platform includes
+ #include <fcntl.h>
+ #include <linux/input.h>
++#include <unistd.h>
+ #if defined(LIBVIRTUALHID_HAVE_XTEST)
+   #include <X11/keysym.h>
+   #include <X11/XF86keysym.h>
+@@ -1098,6 +1100,60 @@ TEST_F(LinuxBackendTest, SwitchProStreamsIdleAndLatestStateUntilClosed) {
+   EXPECT_TRUE(result.switch_pro.stopped_after_destroy);
+ }
+ 
++namespace {
++  constexpr auto usbip_fallback_notice_prefix = "libvirtualhid: DualSense USB/IP unavailable (";
++
++  /**
++   * @brief Run a callable with file descriptor 2 redirected to a temporary file and return what it wrote.
++   *
++   * BaseTest already captures stderr through gtest, which allows one capture at a time, so this redirects the descriptor directly.
++   */
++  template<typename Callable>
++  std::string capture_stderr_during(Callable &&callable) {
++    std::fflush(stderr);
++    std::FILE *captured = std::tmpfile();
++    if (captured == nullptr) {
++      callable();
++      return {};
++    }
++    const auto saved = ::dup(STDERR_FILENO);
++    static_cast<void>(::dup2(fileno(captured), STDERR_FILENO));
++    callable();
++    std::fflush(stderr);
++    static_cast<void>(::dup2(saved, STDERR_FILENO));
++    static_cast<void>(::close(saved));
++
++    std::string text;
++    std::array<char, 1024> buffer {};
++    std::rewind(captured);
++    std::size_t count = 0;
++    while ((count = std::fread(buffer.data(), 1, buffer.size(), captured)) > 0) {
++      text.append(buffer.data(), count);
++    }
++    static_cast<void>(std::fclose(captured));
++    return text;
++  }
++
++  lvh::detail::test::LinuxUsbipRoundTripResult run_usbip_round_trip(std::string &stderr_text) {
++    lvh::detail::test::LinuxUsbipRoundTripResult result;
++    stderr_text = capture_stderr_during([&result] {
++      result = lvh::detail::test::linux_usbip_gamepad_round_trip();
++    });
++    return result;
++  }
++
++  lvh::detail::test::LinuxUsbipFallbackResult run_usbip_fallback(
++    lvh::detail::test::LinuxUsbipFallbackCase fallback_case,
++    std::string &stderr_text
++  ) {
++    lvh::detail::test::LinuxUsbipFallbackResult result;
++    stderr_text = capture_stderr_during([&result, fallback_case] {
++      result = lvh::detail::test::linux_usbip_gamepad_fallback(fallback_case);
++    });
++    return result;
++  }
++}  // namespace
++
+ TEST_F(LinuxBackendTest, SocketpairBackedDualSenseRepliesToFeatureReports) {
+   const auto result = lvh::detail::test::linux_dualsense_uhid_socketpair_reports();
+   EXPECT_TRUE(result.create_status.ok()) << result.create_status.message();
+@@ -1638,3 +1694,99 @@ TEST_F(LinuxBackendTest, PlatformRuntimeReportsUnavailableDeviceCreationWhenNode
+     EXPECT_EQ(mouse.status.code(), lvh::ErrorCode::backend_unavailable);
+   }
+ }
++
++TEST_F(LinuxBackendTest, UsbipGamepadIsNotChosenWithoutEnvironmentVariable) {
++  std::string stderr_text;
++  const auto result = run_usbip_fallback(lvh::detail::test::LinuxUsbipFallbackCase::env_unset, stderr_text);
++  EXPECT_EQ(result.attach_write_count, 0);
++  EXPECT_EQ(stderr_text.find(usbip_fallback_notice_prefix), std::string::npos) << stderr_text;
++  EXPECT_FALSE(result.create_status.ok());
++  EXPECT_NE(result.create_status.message().find("/dev/uhid"), std::string::npos) << result.create_status.message();
++}
++
++TEST_F(LinuxBackendTest, UsbipGamepadFallsBackWhenAttachIsMissing) {
++  std::string stderr_text;
++  const auto result = run_usbip_fallback(lvh::detail::test::LinuxUsbipFallbackCase::attach_missing, stderr_text);
++  EXPECT_EQ(result.attach_write_count, 0);
++  EXPECT_NE(
++    stderr_text.find("libvirtualhid: DualSense USB/IP unavailable (vhci-hcd not loaded or attach not writable), using uhid\n"),
++    std::string::npos
++  ) << stderr_text;
++}
++
++TEST_F(LinuxBackendTest, UsbipGamepadFallsBackWhenNoHighSpeedPortIsFree) {
++  std::string stderr_text;
++  const auto result = run_usbip_fallback(lvh::detail::test::LinuxUsbipFallbackCase::no_free_port, stderr_text);
++  EXPECT_EQ(result.attach_write_count, 0);
++  EXPECT_NE(stderr_text.find("(no free high-speed vhci port), using uhid\n"), std::string::npos) << stderr_text;
++  EXPECT_TRUE(result.detach_text.empty());
++}
++
++TEST_F(LinuxBackendTest, UsbipGamepadRetriesBusyPortsThenFallsBack) {
++  std::string stderr_text;
++  const auto result = run_usbip_fallback(lvh::detail::test::LinuxUsbipFallbackCase::attach_busy, stderr_text);
++  EXPECT_EQ(result.attach_write_count, 3);
++  EXPECT_NE(stderr_text.find("(vhci-hcd ports stayed busy), using uhid\n"), std::string::npos) << stderr_text;
++}
++
++TEST_F(LinuxBackendTest, UsbipGamepadStopsSessionWhenEnumerationTimesOut) {
++  std::string stderr_text;
++  const auto result = run_usbip_fallback(lvh::detail::test::LinuxUsbipFallbackCase::enumeration_timeout, stderr_text);
++  EXPECT_EQ(result.attach_write_count, 1);
++  EXPECT_NE(stderr_text.find("(enumeration timeout), using uhid\n"), std::string::npos) << stderr_text;
++  EXPECT_TRUE(result.peer_saw_eof);
++  EXPECT_EQ(result.detach_text, "1");
++}
++
++TEST_F(LinuxBackendTest, UsbipDualSenseAttachesOnFirstFreePort) {
++  std::string stderr_text;
++  const auto result = run_usbip_round_trip(stderr_text);
++  EXPECT_TRUE(result.create_status.ok()) << result.create_status.message();
++  EXPECT_EQ(result.attach_write_count, 1);
++  EXPECT_EQ(result.attached_port, 1);
++  EXPECT_EQ(result.attached_devid, 0x10001U);
++  EXPECT_EQ(result.attached_speed, 3);
++  EXPECT_TRUE(result.configuration_set);
++  EXPECT_EQ(stderr_text.find(usbip_fallback_notice_prefix), std::string::npos) << stderr_text;
++}
++
++TEST_F(LinuxBackendTest, UsbipDualSenseDescriptorsAdvertiseTheUsbHidDescriptor) {
++  std::string stderr_text;
++  const auto result = run_usbip_round_trip(stderr_text);
++  EXPECT_TRUE(result.create_status.ok()) << result.create_status.message();
++  EXPECT_EQ(result.hid_descriptor_length, 0x0111U);
++}
++
++TEST_F(LinuxBackendTest, UsbipDualSenseSubmittedStateReachesInterruptReports) {
++  std::string stderr_text;
++  const auto result = run_usbip_round_trip(stderr_text);
++  EXPECT_TRUE(result.create_status.ok()) << result.create_status.message();
++  EXPECT_TRUE(result.submit_status.ok()) << result.submit_status.message();
++  EXPECT_TRUE(result.input_report_matches);
++}
++
++TEST_F(LinuxBackendTest, UsbipDualSenseOutputBurstIsOrderedAndOffCallerThread) {
++  std::string stderr_text;
++  const auto result = run_usbip_round_trip(stderr_text);
++  EXPECT_TRUE(result.create_status.ok()) << result.create_status.message();
++  EXPECT_EQ(result.burst_sent, 200U);
++  EXPECT_EQ(result.burst_count, 200U);
++  EXPECT_TRUE(result.burst_in_order);
++  EXPECT_FALSE(result.burst_on_caller_thread);
++}
++
++TEST_F(LinuxBackendTest, UsbipDualSenseFeatureReportReturnsReversedMac) {
++  std::string stderr_text;
++  const auto result = run_usbip_round_trip(stderr_text);
++  EXPECT_TRUE(result.create_status.ok()) << result.create_status.message();
++  const std::array<std::uint8_t, 7> expected {0x09, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02};
++  EXPECT_EQ(result.pairing_prefix, expected);
++}
++
++TEST_F(LinuxBackendTest, UsbipDualSenseCloseDetachesAndEndsSession) {
++  std::string stderr_text;
++  const auto result = run_usbip_round_trip(stderr_text);
++  EXPECT_TRUE(result.close_status.ok()) << result.close_status.message();
++  EXPECT_TRUE(result.peer_saw_eof_after_close);
++  EXPECT_EQ(result.detach_text, "1");
++}
+-- 
+2.43.0
+

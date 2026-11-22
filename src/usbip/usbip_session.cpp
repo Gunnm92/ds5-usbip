@@ -213,7 +213,7 @@ namespace ds5usbip {
         stopping_ = true;
       }
       cv_.notify_all();
-      log(std::format("usbip: session terminée ({} URB isochrones sortants, {} rapports HID envoyés)", iso_out_count_, hid_in_count_));
+      log(std::format("usbip: session terminée ({} URB isochrones sortants, {} rapports HID envoyés)", iso_out_count_.load(), hid_in_count_.load()));
       if (!stop_requested_.load() && callbacks_.closed) {
         callbacks_.closed();
       }
@@ -481,8 +481,8 @@ namespace ds5usbip {
     std::deque<PendingHidIn> hid_pending_;
     Clock::time_point iso_out_anchor_ {};
     Clock::time_point iso_in_anchor_ {};
-    std::size_t iso_out_count_ = 0;
-    std::size_t hid_in_count_ = 0;
+    std::atomic<std::size_t> iso_out_count_ {0};
+    std::atomic<std::size_t> hid_in_count_ {0};
   };
 
   UsbipSession::UsbipSession(int fd, DualSenseDevice &device, Callbacks callbacks, LogFn log):
