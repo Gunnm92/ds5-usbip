@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -144,13 +145,17 @@ namespace {
           {
             std::unique_lock lock(out_mutex_);
             out_cv_.wait(lock, [this] {
-              return has_pending_ || out_stop_;
+              return !queue_.empty() || out_stop_;
             });
             if (out_stop_) {
               return;
             }
-            report.swap(pending_);
-            has_pending_ = false;
+            report = std::move(queue_.front());
+            queue_.pop_front();
+            if (dropped_) {
+              std::fprintf(stderr, "miroir : %zu rapports de sortie perdus (file pleine)\n", dropped_);
+              dropped_ = 0;
+            }
           }
           const int fd = fd_.load();
           if (fd >= 0 && ::write(fd, report.data(), report.size()) < 0 && errno != ENODEV) {
@@ -182,16 +187,21 @@ namespace {
       });
     }
 
-    // Appelé depuis le fil USB/IP : ne bloque jamais. Le rapport est confié
-    // au fil d'écriture ; s'il n'a pas encore envoyé le précédent, seul le
-    // plus récent est gardé. (Un write() direct sur hidraw depuis le fil
-    // USB/IP a provoqué un interblocage : le noyau, verrou hidraw pris,
-    // attendait de ce même fil l'annulation d'un URB.)
+    // Appelé depuis le fil USB/IP : ne bloque jamais. Les rapports sont
+    // mis en file pour le fil d'écriture (un write() direct sur hidraw
+    // depuis le fil USB/IP a provoqué un interblocage : le noyau, verrou
+    // hidraw pris, attendait de ce même fil l'annulation d'un URB). Aucun
+    // rapport n'est fusionné : certains jeux (RIDE 6) n'envoient un effet
+    // de gâchette qu'une fois ; seule une file pleine fait perdre le plus
+    // ancien.
     void output(std::span<const std::uint8_t> report) {
       {
         std::lock_guard lock(out_mutex_);
-        pending_.assign(report.begin(), report.end());
-        has_pending_ = true;
+        if (queue_.size() >= kMaxQueued) {
+          queue_.pop_front();
+          ++dropped_;
+        }
+        queue_.emplace_back(report.begin(), report.end());
       }
       out_cv_.notify_one();
     }
@@ -306,8 +316,9 @@ namespace {
     std::thread writer_;
     std::mutex out_mutex_;
     std::condition_variable out_cv_;
-    std::vector<std::uint8_t> pending_;
-    bool has_pending_ = false;
+    static constexpr std::size_t kMaxQueued = 64;
+    std::deque<std::vector<std::uint8_t>> queue_;
+    std::size_t dropped_ = 0;
     bool out_stop_ = false;
   };
 
