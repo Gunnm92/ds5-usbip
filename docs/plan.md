@@ -511,6 +511,11 @@ retiré) ; socle libvirtualhid dans `libvirtualhid/` (`apply.sh`,
 `Dockerfile.test`, correctif 0001, `FACTS.md`), tests libvirtualhid verts
 en Docker (175/175 hors 21 tests exigeant /dev/uhid).
 
+Release publiée (22/11, 19 h 30) : sunshine-ds-v2026.1122.155624-20261122-1831
+(Sunshine v2026.1122.155624, libvirtualhid dd8153d + correctifs 0001/0002,
+ds5-usbip bc196b7) ; 186/186 tests, backend USB/IP vérifié dans le binaire.
+Reste : étape E (SteamBox, commits locaux) et tests en direct.
+
 Étapes : 1. backend `UsbipGamepad` (copie de libvirtualhid, testé seul
 dans SteamBox) ; 2. compilation et release dans sunshine-ds ; 3.
 récupération par SteamBox (commits locaux) ; 4. test en vrai (Moonlight,
