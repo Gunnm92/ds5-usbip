@@ -14,11 +14,11 @@ Cible : un backend USB/IP intégré à Sunshine (libvirtualhid, C++), à
 partir du code de [vds](https://github.com/hurryman2212/vds) (MIT) ; la
 phase 0 est un prototype C++ autonome.
 
-**État : phases 0 et 1 validées (22/11)** : RIDE 6 et F1 25 envoient leurs
-haptiques HD à la DualSense émulée ; elles sont transmises en RTP au PC
-client et ressenties dans la manette (DS5Dongle). Prochaine étape :
-réglages durables, puis phase 2 (intégration dans Sunshine). Voir
-[docs/plan.md](docs/plan.md).
+**État : phases 0, 1 et 2 validées (22/11)** : la DualSense USB/IP est
+intégrée à Sunshine (projet [sunshine-ds](https://github.com/Gunnm92/sunshine-ds),
+backend libvirtualhid), créée à chaque connexion Moonlight ; les haptiques HD
+des jeux sont ressenties dans la manette du client. Reste à faire : voir
+[docs/plan.md](docs/plan.md), « Bilan au 22/11 ».
 
 ## Organisation
 

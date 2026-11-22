@@ -533,6 +533,37 @@ dans SteamBox) ; 2. compilation et release dans sunshine-ds ; 3.
 récupération par SteamBox (commits locaux) ; 4. test en vrai (Moonlight,
 F1 25, RIDE 6).
 
+## Bilan au 22/11 (soir) et reste à faire
+
+**Fonctionne** : Sunshine de sunshine-ds (release
+`sunshine-ds-v2026.1122.180652-20261122-2016`) crée seul la DualSense USB/IP
+à la connexion Moonlight ; haptiques HD de F1 25 et RIDE 6 ressenties sur le
+client (pleine échelle) ; gâchettes, LED, vibration classique ; transport RTP
+2 ou 4 canaux (`LIBVIRTUALHID_DUALSENSE_RTP_CHANNELS=4`). F1 25 n'envoie
+rien au haut-parleur de la manette (mesuré : canaux 1-2 nuls) ; le
+4 canaux sert aux jeux qui l'utilisent.
+
+**Reste à faire :**
+1. SteamBox : commits locaux (17d8bac, d02c8c4, abacf14, 7d2e59c,
+   f958479 annulé) à pousser à la fin du projet, sur accord.
+2. Registre : le téléchargement par Unraid passe par le NAT en boucle
+   (lent). Choix à faire : `--insecure-registry=10.1.1.1:5003` dans
+   `/boot/config/docker.cfg` + modèle sur `10.1.1.1:5003/steambox:latest`
+   (recommandé), ou `registry.elfenn.eu:18443` + résolution locale
+   (Nginx Proxy Manager écoute en 18443, le 443 d'Unraid sert `nas.local`).
+3. Fichier `go` d'Unraid : `modprobe vhci-hcd snd-usb-audio` avant Docker
+   (sans vhci-hcd, le montage manque et SteamBox ne démarre pas).
+4. AIBox (projet AIBox, voir plus haut) : récepteur RTP 4 canaux, volume
+   du dongle à 100 %, loopback désactivé, persistance, et verrouillage du
+   récepteur sur le dongle (dont-reconnect / dont-fallback cassent la
+   liaison).
+5. Grésillements à pleine échelle (actionneurs ou conversion 8 bits du
+   dongle) : gain d'émission (`LIBVIRTUALHID_DUALSENSE_HAPTICS_GAIN`) ou
+   filtre du dongle, au ressenti.
+6. Destination RTP automatique (adresse du client Moonlight connue de
+   Sunshine) au lieu de la variable fixe ; app compagnon
+   (`docs/parametres.md`) ; latence.
+
 ### Phase 3 — mise en production
 
 - Service s6 dans SteamBox (démarrage avec une session Moonlight, arrêt à la
