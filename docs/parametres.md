@@ -43,13 +43,15 @@ la recopie (`miroir : …`).
 
 ## 3. PipeWire d'AIBox (client)
 
-Fichier `~/.config/pipewire/pipewire.conf.d/ds5-usbip-haptics.conf`
-([client/pipewire/](../client/pipewire/ds5-usbip-haptics.conf)).
+Config portée par le dépôt AIBox depuis le 23/11 : récepteur dans
+`/etc/aibox/ds5-usbip-rtp.conf` (chargé par `ds5-usbip.service`), règle de
+latence du dongle `52-ds5dongle-latency.conf` (WirePlumber).
 
 | Réglage | Valeur actuelle | Plage / choix | Comment | À chaud |
 |---|---|---|---|---|
-| **Tampon de réception** (`sess.latency.msec`) | 40 ms | doit dépasser le délai de la sortie du dongle : à 10 ms, silence ; minimum réel à mesurer | fichier + `systemctl --user restart pipewire` (coupe le son de Moonlight : quitter la session avant) ; pour essayer : `pw-cli -m load-module libpipewire-module-rtp-source '{ … }'` sur un autre port | non (fichier) ; oui (pw-cli) |
-| Canaux de destination (`audio.position`) | `[ RL RR ]` | `[ RL RR ]` en profil « Direct » du dongle, `[ AUX2 AUX3 ]` en pro-audio | fichier | non |
+| **Tampon de réception** (`sess.latency.msec`) | 20 ms | doit dépasser le délai de la sortie du dongle : 20 ms validé avec le dongle en blocs de 128 (40 ms sans) ; 10 ms : silence | fichier + `systemctl --user restart ds5-usbip.service` (coupe le son de Moonlight : quitter la session avant) ; pour essayer : `pw-cli -m load-module libpipewire-module-rtp-source '{ … }'` sur un autre port | non (fichier) ; oui (pw-cli) |
+| Canaux de destination (`audio.position`) | `[ FL FR RL RR ]` | 4 canaux en profil « Direct » du dongle (`[ AUX0 … AUX3 ]` en pro-audio) ; 2 canaux : `[ RL RR ]` | fichier | non |
+| Blocs de la sortie du dongle (`api.alsa.period-size`, `node.latency`) | 128 | 128 validé (23/11) ; 256 si craquements ; 512 par défaut | règle WirePlumber + redémarrage de WirePlumber | non |
 | Port de réception (`source.port`) | 46100 | doit valoir celui de `--haptics-to` | fichier | non |
 | **Volume de la sortie du dongle** (`ds5_dongle_sink`) | **100 %** | à 40 %, -24 dB de plus | `pactl set-sink-volume ds5_dongle_sink 100%` | oui |
 | Volume du flux reçu (`ds5_usbip_haptics`) | 100 % | > 100 % = gain logiciel (échelle cubique : 160 % ≈ ×4, 200 % ≈ ×8), écrête | `pactl set-sink-input-volume <flux> N%` | oui |
@@ -87,11 +89,11 @@ au-delà = préférence personnelle), mode et Haptics Gain du dongle, marche/arr
 
 **Latence** (décidé le 22/11) : réglée par l'app plutôt que figée. Elle
 cumule le trajet réseau (~12 ms vers AIBox) et le tampon de réception
-(40 ms aujourd'hui). L'app peut chercher le minimum en chargeant à chaud un
+(20 ms depuis le 23/11). L'app peut chercher le minimum en chargeant à chaud un
 récepteur d'essai (`pw-cli load-module libpipewire-module-rtp-source`)
 avec un tampon décroissant, puis écrire la valeur retenue dans
-`ds5-usbip-haptics.conf` (application au prochain redémarrage de
-PipeWire, hors session Moonlight). En dessous du délai de la sortie du
+`/etc/aibox/ds5-usbip-rtp.conf` (application au redémarrage de
+`ds5-usbip.service`, hors session Moonlight). En dessous du délai de la sortie du
 dongle, le récepteur ne joue que du silence (« Delay to device is higher
 than the target buffer size »). Contrôles d'état :
 manette branchée, flux haptique du jeu sur la bonne sortie, volumes à

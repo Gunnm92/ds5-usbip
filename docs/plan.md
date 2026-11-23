@@ -568,19 +568,19 @@ bind RTSP server to port 48010 ». Un seul des deux à la fois.
    `/boot/config/docker.cfg`, modèle sur `10.1.1.1:5003/steambox:latest`).
 3. Fichier `go` d'Unraid : `modprobe vhci-hcd snd-usb-audio` avant Docker
    (sans vhci-hcd, le montage manque et SteamBox ne démarre pas).
-4. AIBox : intégration faite dans son projet (22/11), d'après
-   `docs/aibox.md`.
+4. AIBox : intégration faite dans son projet (22/11), latence comprise
+   (23/11). Config client retirée de ce dépôt (`client/`, `docs/aibox.md`,
+   voir l'historique git) : AIBox la porte.
 5. Grésillements à pleine échelle : plus constatés (23/11, ressenti de
    l'utilisateur) ; rien à faire.
 6. Destination RTP automatique : faite (correctif sunshine-ds 0001, page
    « DualSense », validée le 23/11). sunshine-ds poussé (main f63eb4e,
    release 20261122-2309).
 7. Latence : faite (23/11). Dongle en blocs de 128 (règle
-   `client/wireplumber/52-ds5dongle-latency.conf`) et tampon RTP à 20 ms
+   `52-ds5dongle-latency.conf`) et tampon RTP à 20 ms
    (`sess.latency.msec`) : côté AIBox ~25 ms au lieu de ~60, validé sur
-   plusieurs jeux, aucune erreur dans `pw-top`. 15 ms non essayé. À
-   reporter dans l'image AIBox (règle WirePlumber, valeur 20 dans
-   `/etc/aibox/ds5-usbip-rtp.conf`).
+   plusieurs jeux, aucune erreur dans `pw-top`. 15 ms non essayé.
+   Intégré à l'image AIBox (23/11).
 8. Page « DualSense » de Sunshine : la rendre plus attrayante (mise en
    page, état en direct de la manette, retour visuel des réglages).
    Libellé « Port vhci » ambigu (pris pour un port réseau) : le renommer,

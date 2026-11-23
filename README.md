@@ -30,9 +30,6 @@ Reste à faire : [docs/plan.md](docs/plan.md).
 | AIBox | PC client : réception RTP, latence et volume du DS5Dongle, service de démarrage. |
 | Hôte Unraid | Modules `vhci-hcd` et `snd-usb-audio` au démarrage. |
 
-`client/` et [docs/aibox.md](docs/aibox.md) sont la configuration de
-référence du client, à reprendre dans AIBox ; ils quitteront ce dépôt une
-fois AIBox à jour.
 
 ## Organisation
 
