@@ -28,9 +28,14 @@ vers `archiso/airootfs/etc/pipewire/pipewire.conf.d/ds5-usbip-haptics.conf`
 
 Points de ce fichier qui ont été établis à l'essai :
 
-- `sess.latency.msec = 40` : à 10 ms, le tampon est plus court que le délai
-  de la sortie du dongle ; `module-rtp-source` le ramène alors à zéro et ne
-  joue que du silence.
+- `sess.latency.msec = 20` (validé le 23/11 sur plusieurs jeux), **avec**
+  la règle [client/wireplumber/52-ds5dongle-latency.conf](../client/wireplumber/52-ds5dongle-latency.conf)
+  à copier vers `archiso/airootfs/etc/wireplumber/wireplumber.conf.d/` :
+  blocs de 128 échantillons au dongle au lieu de 512. Sans cette règle,
+  rester à 40 : à 10 ms, le tampon est plus court que le délai de la sortie
+  du dongle ; `module-rtp-source` le ramène alors à zéro et ne joue que du
+  silence. Sur l'AIBox actuelle, la valeur vit dans
+  `/etc/aibox/ds5-usbip-rtp.conf` (chargé par `ds5-usbip.service`).
 - `audio.position = [ FL FR RL RR ]` : en profil « Direct », les canaux du
   dongle s'appellent FL FR RL RR (pas AUX). En profil pro-audio, mettre
   `[ AUX0 AUX1 AUX2 AUX3 ]`. Avec seulement 2 canaux reçus :

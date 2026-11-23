@@ -575,9 +575,12 @@ bind RTSP server to port 48010 ». Un seul des deux à la fois.
 6. Destination RTP automatique : faite (correctif sunshine-ds 0001, page
    « DualSense », validée le 23/11). sunshine-ds poussé (main f63eb4e,
    release 20261122-2309).
-7. Latence : ~50 ms (40 ms de tampon client + réseau). Mesurer le délai de
-   la sortie du dongle sur AIBox, puis descendre `sess.latency.msec` au
-   minimum qui joue encore (10 ms = silence le 22/11).
+7. Latence : faite (23/11). Dongle en blocs de 128 (règle
+   `client/wireplumber/52-ds5dongle-latency.conf`) et tampon RTP à 20 ms
+   (`sess.latency.msec`) : côté AIBox ~25 ms au lieu de ~60, validé sur
+   plusieurs jeux, aucune erreur dans `pw-top`. 15 ms non essayé. À
+   reporter dans l'image AIBox (règle WirePlumber, valeur 20 dans
+   `/etc/aibox/ds5-usbip-rtp.conf`).
 8. Page « DualSense » de Sunshine : la rendre plus attrayante (mise en
    page, état en direct de la manette, retour visuel des réglages).
    Libellé « Port vhci » ambigu (pris pour un port réseau) : le renommer,
