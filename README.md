@@ -14,11 +14,25 @@ Cible : un backend USB/IP intégré à Sunshine (libvirtualhid, C++), à
 partir du code de [vds](https://github.com/hurryman2212/vds) (MIT) ; la
 phase 0 est un prototype C++ autonome.
 
-**État : phases 0, 1 et 2 validées (22/11)** : la DualSense USB/IP est
-intégrée à Sunshine (projet [sunshine-ds](https://github.com/Gunnm92/sunshine-ds),
-backend libvirtualhid), créée à chaque connexion Moonlight ; les haptiques HD
-des jeux sont ressenties dans la manette du client. Reste à faire : voir
-[docs/plan.md](docs/plan.md), « Bilan au 22/11 ».
+**État (23/11)** : phases 0 à 2 validées. La DualSense USB/IP est créée par
+Sunshine à chaque connexion Moonlight ; les haptiques HD et le haut-parleur
+partent en RTP vers l'adresse du client (automatique), avec une page
+« DualSense » dans l'interface web de Sunshine. Latence côté client ~25 ms.
+Reste à faire : [docs/plan.md](docs/plan.md).
+
+## Qui porte quoi
+
+| Dépôt | Rôle |
+|---|---|
+| **ds5-usbip** (ici) | Bibliothèque USB/IP de la DualSense (`src/usbip/`), outils de mise au point, correctifs qui la posent dans libvirtualhid (`libvirtualhid/`), plan et journal des essais. |
+| [sunshine-ds](https://github.com/Gunnm92/sunshine-ds) | Sunshine construit avec ce backend : clone ds5-usbip et lance `libvirtualhid/apply.sh`, ajoute ses propres correctifs Sunshine (destination automatique, page DualSense), règle WirePlumber côté serveur, release. |
+| [SteamBox](https://github.com/Gunnm92/SteamBox) | Image du serveur de jeu : installe la release sunshine-ds, accès à vhci-hcd. |
+| AIBox | PC client : réception RTP, latence et volume du DS5Dongle, service de démarrage. |
+| Hôte Unraid | Modules `vhci-hcd` et `snd-usb-audio` au démarrage. |
+
+`client/` et [docs/aibox.md](docs/aibox.md) sont la configuration de
+référence du client, à reprendre dans AIBox ; ils quitteront ce dépôt une
+fois AIBox à jour.
 
 ## Organisation
 
@@ -27,7 +41,10 @@ des jeux sont ressenties dans la manette du client. Reste à faire : voir
   helpers vhci-hcd, envoi RTP des haptiques. Aucune sortie console : les
   messages passent par un `LogFn`.
 - `src/tools/` : programmes en ligne de commande (serveur TCP, attache, local).
-- `tests/cpp/` : tests C++ de la bibliothèque ; `tests/*.py` : tests Python.
+- `libvirtualhid/` : `apply.sh` copie `src/usbip/` dans libvirtualhid et
+  applique les correctifs (manette USB/IP, destination, réglages, état).
+- `tests/cpp/` : tests C++ de la bibliothèque ; `tests/*.py` : tests Python
+  (client USB/IP, mire RTP, relecture d'un enregistrement).
 
 ## Compilation
 
